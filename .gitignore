@@ -1,0 +1,26 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+!.env.prod.example
+
+# Backups written by scripts/backup.sh
+backups/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+.fleet/
+
+# Go
+# NOTE: go.sum must NEVER be ignored — it locks dependency checksums and is required for
+# reproducible builds.
+vendor/
+*.exe
+/main
+/crawler
+/backfill
