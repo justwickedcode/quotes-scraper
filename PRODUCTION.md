@@ -1,124 +1,84 @@
-# Production deployment
+# Production
 
-`docker-compose.yml` deploys the crawler plus its own private Redis (`crawler-redis`). It
-deliberately has **no** `postgres` service block — it deploys against the shared Postgres that
-already exists elsewhere (e.g. a Dokploy Database resource you manage and back up separately),
-via `DATABASE_URL`. `docker-compose.dev.yml` is the local-dev Postgres/Redis only.
+`docker-compose.yml` runs the crawler and a private Redis. Postgres is not part of it: the
+crawler connects to an existing database through `DATABASE_URL`. (`docker-compose.dev.yml` is
+for local development only.)
 
-This project was split out of the Vroomy monorepo (`backend/scraper`), git history included.
+## Schema contract
 
-## Contract with consumers
+The database is the crawler's only interface. The crawler owns the schema, migrates it on
+startup, and is the only writer. Consumers point their own `DATABASE_URL` at the same database
+and read from it. Start the crawler once against a fresh database before anything else depends
+on the tables.
 
-The crawler's only interface to anything else is the **Postgres database itself**. It owns the
-schema (`quotes`, `url_frontier`), self-migrates on startup (goose, default
-`goose_db_version` table), and is the only writer. Consumers just point their own
-`DATABASE_URL` at the same database and read.
+The Vroomy API reads these `quotes` columns, so don't rename or drop them without updating it
+first:
 
-Vroomy (`api` and `ws`) currently depends on these `quotes` columns — treat them as a public
-interface and don't rename/drop them without updating Vroomy first:
+| Column | Used for |
+| --- | --- |
+| `id` | random selection (`id >= random`) |
+| `text`, `author`, `source` | the passage and its attribution |
+| `language` | filter (`en`, `de`, …) |
+| `word_count` | length filter |
+| `game_unsuitable` | filter (`= false`); also set for authors on the `excluded_authors` list |
 
-| Column            | Used for                                                          |
-| ----------------- | ----------------------------------------------------------------- |
-| `id`              | random-pick by `id >= random` scan                                |
-| `text`            | the passage                                                       |
-| `author`          | shown with the passage                                            |
-| `source`          | shown with the passage                                            |
-| `language`        | filter (`en`, `de`, …)                                            |
-| `word_count`      | filter (`BETWEEN minWords AND maxWords`)                          |
-| `game_unsuitable` | filter (`= false`) — see `internal/scoring` / `cmd/backfill`      |
+Redis holds only rebuildable state (frontier queues, the SimHash index), so it runs with no
+persistence and no password, on a network nothing else joins.
 
-Redis is private to the crawler — it runs inside this Compose project on a network nothing else
-joins, nothing else reads it, and it's fully rebuildable from Postgres on every start
-(`WarmSimhashCache`, `WarmFrontierCache`). That's why it has no password and no persistence.
+## Configuration
 
-The crawler must have started at least once against a fresh database before any consumer
-relies on the `quotes` table existing.
+| Variable | Notes |
+| --- | --- |
+| `DATABASE_URL` | Required. See `.env.prod.example`. |
+| `LOG_LEVEL` | `error` by default in the compose file; `warn` or `info` for more detail. |
 
-## 1. Required environment variables
+`REDIS_ADDR`, `REDIS_DB` and `GOMEMLIMIT` are set in the compose file.
 
-```
-DATABASE_URL  — the shared quotes Postgres connection string
-```
-
-That's the only one. `.env.prod.example` documents it — copy it to `.env.prod` (gitignored) if
-deploying with plain `docker compose`. `REDIS_ADDR` (pointing at the bundled `crawler-redis`),
-`REDIS_DB` and `GOMEMLIMIT` are already set in the compose file;
-`LOG_LEVEL` defaults to `error` there and can be overridden (see below).
-
-## 2. Bring it up (plain `docker compose`, no Dokploy)
+## Running
 
 ```bash
 docker compose --env-file .env.prod up -d --build
 docker compose --env-file .env.prod logs -f
 ```
 
-`restart: unless-stopped`, no ports, no healthcheck — it's a background worker with no HTTP
-server; its logs are the signal to watch. Stops cleanly on `SIGTERM`.
+It's a background worker: no ports, no HTTP server, and it shuts down cleanly on `SIGTERM`. To
+run it only at certain times of day, stop and start the container.
 
-The crawler joins the external `dokploy-network` to reach Postgres (see finding #3); Redis stays
-on the project's own `internal` network. Off Dokploy, either create that network
-(`docker network create dokploy-network`) or drop it from the crawler's `networks:` and make sure
-your Postgres is reachable some other way.
+The crawler joins the external `dokploy-network` to reach Postgres. Outside Dokploy, either
+create that network (`docker network create dokploy-network`) or remove it from the compose file
+and make Postgres reachable another way.
 
-## 3. Backups
+### Dokploy
 
-If Postgres is managed by an orchestrator with its own backup scheduler (e.g. Dokploy's
-per-database scheduled backups to S3-compatible storage), use that. Otherwise:
+- Deploy as a **Compose** project using `docker-compose.yml`. No domain is needed.
+- Set `DATABASE_URL` under **Environment Settings** with **Create Environment File** enabled.
+  Without it, `${VAR}` references resolve to empty strings. Changing variables requires a
+  redeploy.
+
+## Resources
+
+- **Memory:** the crawler needs about 1.25 GB, most of it the language-detection models. The
+  compose file sets a 2 GB limit and `GOMEMLIMIT=1536MiB`; setting `GOMEMLIMIT` lower only makes
+  the GC thrash. If the container is killed anyway, nothing is lost: Redis is rebuilt from
+  Postgres and in-flight URLs are requeued on the next start.
+- **Small hosts (4–5 GB):** add a swapfile so a short spike pages out instead of getting killed.
+- **Logs:** capped at 10 MB × 3 files.
+- **Database connections:** at least 20 by default. Set `pool_max_conns` in `DATABASE_URL` to
+  change it.
+
+## Backups
+
+Use your Postgres host's scheduled backups if it has them. Otherwise, `scripts/backup.sh` writes
+a gzipped `pg_dump` to `./backups` and deletes dumps older than 14 days:
 
 ```bash
 POSTGRES_USER=quotes POSTGRES_DB=quotes POSTGRES_CONTAINER=quotes-postgres ./scripts/backup.sh
 ```
 
-Dumps to `./backups/quotes_<timestamp>.sql.gz` and prunes anything older than 14 days
-(`RETENTION_DAYS`, `BACKUP_DIR` are overridable). Schedule it with cron:
+Run it from cron, and point `BACKUP_DIR` at storage that's synced offsite.
 
-```cron
-0 3 * * * cd /path/to/quotes-crawler && POSTGRES_USER=quotes POSTGRES_DB=quotes POSTGRES_CONTAINER=quotes-postgres ./scripts/backup.sh >> /var/log/quotes-backup.log 2>&1
-```
+## Migrations
 
-Local disk only — point `BACKUP_DIR` somewhere synced offsite for real disaster recovery.
-
-## 4. Deploying via Dokploy
-
-- Deploy as a **Compose** project with compose path `docker-compose.yml` (Dokploy's default). No Domain — there
-  is nothing to route to.
-- Set `DATABASE_URL` under **Environment Settings** with **"Create Environment
-  File"** enabled — with it off, every `${VAR}` silently resolves to an empty string. Saving env
-  vars alone doesn't touch running containers; trigger a real **redeploy**.
-- **No Redis Database resource needed** — the compose file runs its own. (`REDIS_ADDR` still
-  accepts a `redis://...` URL if you ever point it at an external Redis again: `ConnectRedis`
-  switches to URL parsing for anything containing `://`.)
-- **Memory**: 2 GB hard limit, `GOMEMLIMIT=1536MiB`, both in the compose file (see finding #2).
-  A memory-limit kill is a blip, not an incident: Redis is rehydrated from Postgres on start and
-  `db.RequeueStuckInProgress` recovers URLs a killed process left mid-fetch.
-- **On a small host (4–5 GB), add a swapfile** so a transient spike pages out instead of OOM-killing:
-  ```bash
-  sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
-  sudo mkswap /swapfile && sudo swapon /swapfile
-  echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
-  ```
-- **Day/night scheduling = stop/start the container**, not an in-app pause. An earlier in-app
-  active-hours pause was reverted: it cut CPU/network but never freed the ~1.25 GB the language
-  models hold. Now that the crawler is its own Compose project, Dokploy can stop/start it without
-  touching anything else.
-- **`LOG_LEVEL`**: `info` logs everything; `warn` drops per-page/per-quote narration but keeps
-  skips/retries/backoffs; `error` keeps genuine failures only. There is no `debug` — it's
-  rejected at startup. The compose file defaults to `error`; for full output set
-  `LOG_LEVEL=info` under **Environment Settings** and redeploy, then remove it and redeploy again.
-- **Log size** is capped at 10 MB × 3 via the compose `x-logging` anchor.
-
-## Findings from live testing
-
-1. **`REDIS_ADDR=redis:6379` silently connected to the wrong host.** `redis.ParseURL("redis:6379")`
-   parses `"redis"` as a scheme and yields `Addr="localhost:6379"`. Invisible in dev because
-   `REDIS_ADDR` there really is `localhost:6379`. Fixed in `internal/db/redis.go`.
-2. **Real memory need is ~1.25 GB**, not ~250 MB. The language detector's models (~330 MB even
-   restricted to Latin-script languages) plus crawl overhead plateau there. Limits were
-   **measured** (limit removed, usage observed over a sustained run). Setting `GOMEMLIMIT` below
-   real need just made the GC burn 400–600% CPU before OOMing anyway.
-3. **A plain Compose deploy lands on its own isolated network**, with no route to Dokploy's
-   Database resources on `dokploy-network` — hostnames fail DNS resolution (easy to misread as a
-   credentials problem). Fixed by putting the crawler on the external `dokploy-network`.
-
-If you change what the crawler does in a way that could shift its memory profile, re-measure
-with `docker stats` against an unconstrained container rather than trusting these numbers.
+Migrations run automatically on startup, and each pending one is logged before it starts.
+While a migration runs, it can lock `quotes`. The largest so far (excluded authors) took about
+5 seconds on 2.7M rows.
