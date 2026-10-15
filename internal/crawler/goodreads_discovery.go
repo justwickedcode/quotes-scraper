@@ -197,7 +197,7 @@ func (c *Crawler) seedGoodreadsAuthorSearches(ctx context.Context) topUpResult {
 			return topUpResult{}
 		}
 		log.Printf("goodreads: queued %d author-name searches from quotes up to id %d (e.g. %s)", len(inserted), lastID, inserted[0])
-		return topUpResult{added: true}
+		return topUpResult{added: true, newURLs: len(inserted)}
 	}
 	return topUpResult{}
 }

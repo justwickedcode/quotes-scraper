@@ -60,35 +60,11 @@ const (
 	// more margin against getting rate-limited again on the very next attempt.
 	wikiquoteStallPenalty = 15 * time.Second
 
-	// wikiquoteDeadStreakThreshold: after this many consecutive Wikiquote pages in a row with
-	// 0 quotes, the current discovery category is treated as low-yield and skipped early
-	// rather than ground through to its end. Categories aren't perfectly pure — some
-	// non-biographical pages (year articles, topic pages like "Black people") are members
-	// too, confirmed live — so this is a second layer of defense on top of category-based
-	// discovery, not a replacement for it.
-	wikiquoteDeadStreakThreshold = 5
-
-	// wikiquoteEmptyStreakBeforeAllPages: after this many consecutive category-walk calls in a
-	// row add zero new URLs (the curated walk, including its recursive subcategory descent, has
-	// nothing new right then), discovery switches to walking the edition's full article list
-	// (list=allpages) until that pass ends — see wikiquoteTopUpFunc. Kept low (it used to be 10)
-	// because the smaller localized editions exhaust their few curated categories quickly —
-	// confirmed live, French once had a 94-minute gap with zero new quotes.
-	wikiquoteEmptyStreakBeforeAllPages = 2
-
-	// goodreadsEmptyStreakBeforeRandom: after this many consecutive tag-cycling attempts in a row add nothing new (every tag in
-	// goodreadsTags already seeded at least once — see topUpGoodreadsTag), fall back to
-	// topUpGoodreadsRandomPages once. Goodreads' curated tag list is much shorter than any
-	// Wikiquote edition's category list (19 tags vs. tens of categories), so once it's dry it
-	// stays dry every single call from then on, not just occasionally — there's no need to wait
-	// out a long streak to be confident that's really what's happening.
+	// goodreadsEmptyStreakBeforeRandom: after this many consecutive tag-cycling attempts in a row
+	// add nothing new (every tag in goodreadsTags already seeded at least once — see
+	// topUpGoodreadsTag), fall back to topUpGoodreadsRandomPages once. The tag list is short
+	// (19 tags), so once it's dry it stays dry; there's no need to wait out a long streak.
 	goodreadsEmptyStreakBeforeRandom = 3
-
-	// wikiquoteRandomModeSpan: once a full allpages pass over an edition queues nothing new, its
-	// feeder switches to list=random batches (see wikiquoteTopUpFunc) instead of pausing, and
-	// stays there this long before restarting the category walk and the next allpages pass.
-	// Requested explicitly over the earlier 6h pause ("go aggressive ... with /random").
-	wikiquoteRandomModeSpan = 1 * time.Hour
 
 	// goodreadsRandomPageMax bounds which page of Goodreads' own /quotes "popular quotes" listing
 	// topUpGoodreadsRandomPages picks from — confirmed live the listing paginates to page 100
@@ -250,7 +226,7 @@ func SetLogLevel(level string) error {
 }
 
 // logWarn is log.Printf for a warning: the crawler tried something and skipped/backed off/gave
-// up on it (a rejected quote, a low-yield category abandoned, a retry after a transient
+// up on it (a rejected quote, a retry after a transient
 // failure) — not a hard error, but the kind of thing an operator watching a quieted-down
 // production log still wants to see. Suppressed only at logLevelError.
 func logWarn(format string, args ...interface{}) {
@@ -438,6 +414,7 @@ type topUpResult struct {
 	calledNetwork bool
 	networkFailed bool
 	rateLimited   bool // specifically a 429, not just any networkFailed — see fetcher.IsRateLimited
+	newURLs       int  // how many URLs were queued, when known; 0 with added means "some"
 }
 
 type Crawler struct {
@@ -448,201 +425,9 @@ func New(store *db.Store) *Crawler {
 	return &Crawler{store: store}
 }
 
-// recordWikiquoteYield tracks consecutive zero-quote fetches for one Wikiquote edition.
-// Pure — takes the caller's current streak and returns the updated one — rather than a field
-// on Crawler, because each edition now runs on its own dedicated worker goroutine (see
-// runWorker) with its own local streak variable; there is no shared state left to keep in
-// sync, and a shared map here would just reintroduce a data race across goroutines for no
-// benefit. After wikiquoteDeadStreakThreshold in a row, it treats the current discovery
-// category as low-yield and force-advances that edition's cursor to the next one — otherwise
-// a category with a long stretch of non-biographical members (e.g. a topic page like "Black
-// people" sitting inside Category:People, or worse, leftover pending URLs from before this
-// category-based approach existed) would keep getting ground through one cooldown-interval
-// fetch at a time for no benefit. Only the *discovery* cursor moves; URLs already sitting in
-// the pending queue from the current low-yield batch still get fetched — there's no per-batch
-// tag on frontier rows to selectively drop them, so this only prevents drawing *more* of the
-// same bad category next time, not clearing what's already queued.
-func (c *Crawler) recordWikiquoteYield(ctx context.Context, site wikiquoteSite, deadStreak int, gotQuotes bool) int {
-	if gotQuotes {
-		return 0
-	}
-	deadStreak++
-	if deadStreak < wikiquoteDeadStreakThreshold {
-		return deadStreak
-	}
-
-	raw, err := c.store.GetDiscoveryCursor(ctx, site.source)
-	if err != nil {
-		log.Printf("Could not load %s discovery cursor to skip a low-yield category: %s\n", site.source, err)
-		return 0
-	}
-	cursor := decodeWikiquoteCursor(raw)
-	// Same out-of-range guard topUpWikiquoteCategories already applies when *reading* a
-	// cursor — needed here too, on the *write* path, or a run of dead-streak skips can push
-	// CategoryIndex arbitrarily far past the curated list's length before the next top-up call
-	// happens to catch and reset it. Purely cosmetic in the meantime (topUp's own guard means
-	// nothing actually gets stuck), but it did make this log line print a useless "?" instead
-	// of ever wrapping back to a real category name — found live, every one of those "?"s
-	// traced back to exactly this.
-	if cursor.CategoryIndex >= len(site.curatedCategories) {
-		cursor = wikiquoteDiscoveryCursor{}
-	}
-	skipped := cursor.Current
-	if skipped == "" && cursor.CategoryIndex < len(site.curatedCategories) {
-		skipped = site.curatedCategories[cursor.CategoryIndex]
-	}
-	if skipped == "" {
-		skipped = "?"
-	}
-	// Abandon the whole top-level branch, not just wherever we happened to be within it
-	// (possibly deep in a subcategory) — a persistently low-yield area isn't worth resuming
-	// elsewhere inside the same branch, only worth escaping entirely.
-	next := wikiquoteDiscoveryCursor{CategoryIndex: cursor.CategoryIndex + 1}
-	if err := c.store.SetDiscoveryCursor(ctx, site.source, next.encode()); err != nil {
-		log.Printf("Could not save %s discovery cursor after skipping a low-yield category: %s\n", site.source, err)
-		return 0
-	}
-	logWarn("%s: %d consecutive pages with 0 quotes — skipping the rest of category %q for next time", site.source, wikiquoteDeadStreakThreshold, skipped)
-	return 0
-}
-
-// topUpWikiquoteCategories fetches the next batch of one of the edition's curated categories via
-// the MediaWiki API and queues it. The feeder (see feeder.go) decides when that's needed. This is what keeps a Wikiquote
-// edition from running dry mid-session — the fixed stopgap seed list (English only) only
-// lasts ~20 pages, and SeedFrontier only runs once at startup, so without this the crawler
-// would just sit idle once that list was consumed, even with real content still available to
-// discover. German has no stopgap seed list at all — it bootstraps entirely from this the
-// first time it's idle, the same as Goodreads' tag fallback does.
-//
-// Categories over blind alphabetical enumeration: filters out the large fraction of Wikiquote
-// articles that are never going to have quotes (movies, TV shows, books, historical events)
-// by only walking pages Wikiquote itself has tagged under an occupation — confirmed live to
-// meaningfully reduce "0 quotes, 0 discovered URLs" dead-end fetches.
-//
-// Once every curated category is fully walked, the cursor wraps back to the first one and
-// starts over — Wikiquote gains new articles over time, so a full pass eventually finds fresh
-// content again; in the meantime it's a cheap no-op (ON CONFLICT DO NOTHING skips everything
-// already known, so `added` stays 0 and the caller's dead-end fallback — see
-// topUpGoodreadsTag — takes over instead of this looping forever on stale data).
-func (c *Crawler) topUpWikiquoteCategories(ctx context.Context, site wikiquoteSite) topUpResult {
-	raw, err := c.store.GetDiscoveryCursor(ctx, site.source)
-	if err != nil {
-		log.Printf("Could not load %s discovery cursor: %s\n", site.source, err)
-		return topUpResult{}
-	}
-	cursor := decodeWikiquoteCursor(raw)
-	if cursor.CategoryIndex >= len(site.curatedCategories) {
-		logInfo("%s discovery: finished all %d curated categories (and their subcategories), restarting from the beginning", site.source, len(site.curatedCategories))
-		cursor = wikiquoteDiscoveryCursor{}
-	}
-
-	category := cursor.Current
-	if category == "" {
-		category = site.curatedCategories[cursor.CategoryIndex]
-	}
-
-	// One call returns both category's own member pages and its direct subcategories — see
-	// fetchWikiquoteCategoryMembers for why this is one request, not two.
-	pages, subcats, nextCMContinue, err := fetchWikiquoteCategoryMembers(ctx, site, category, cursor.CMContinue)
-	if err != nil {
-		log.Printf("%s title discovery failed (category=%q): %s — backing off ~%s (jittered)\n", site.source, category, err, wikiquoteStallPenalty)
-		return topUpResult{calledNetwork: true, networkFailed: true, rateLimited: fetcher.IsRateLimited(err)}
-	}
-
-	visited := make(map[string]bool, len(cursor.Visited))
-	for _, v := range cursor.Visited {
-		visited[v] = true
-	}
-	queue := append([]string{}, cursor.Queue...)
-	var newlyQueued []string
-	for _, sc := range subcats {
-		if visited[sc] {
-			continue
-		}
-		visited[sc] = true
-		queue = append(queue, sc)
-		newlyQueued = append(newlyQueued, sc)
-	}
-	if len(newlyQueued) > 0 {
-		logInfo("%s discovery: category %q has %d new subcategory(ies) queued to explore (e.g. %q)", site.source, category, len(newlyQueued), newlyQueued[0])
-	}
-	updatedVisited := make([]string, 0, len(visited))
-	for v := range visited {
-		updatedVisited = append(updatedVisited, v)
-	}
-
-	var next wikiquoteDiscoveryCursor
-	switch {
-	case nextCMContinue != "":
-		// Category still paginating — stay on it, carrying the (possibly just-grown) queue
-		// forward so subcategories found on this page aren't lost before the category finishes.
-		next = wikiquoteDiscoveryCursor{
-			CategoryIndex: cursor.CategoryIndex,
-			Current:       category,
-			CMContinue:    nextCMContinue,
-			Queue:         queue,
-			Visited:       updatedVisited,
-		}
-	case len(queue) > 0:
-		// This category (both its pages and its own subcategories) is fully known — descend
-		// into the next queued subcategory instead of moving to the next top-level category,
-		// which is what turns a fixed curated-category list into real coverage of Wikiquote's
-		// actual category tree. Confirmed live: Category:Writers, already fully mined at the
-		// top level, has real, on-topic subcategories like "Gay writers" and "Writers by
-		// language" that a flat list never reaches.
-		next = wikiquoteDiscoveryCursor{
-			CategoryIndex: cursor.CategoryIndex,
-			Current:       queue[0],
-			Queue:         queue[1:],
-			Visited:       updatedVisited,
-		}
-	default:
-		// Nothing left anywhere in this top-level category's subtree — move on.
-		logInfo("%s discovery: category %q and all its subcategories are fully explored, moving to the next curated category", site.source, category)
-		next = wikiquoteDiscoveryCursor{CategoryIndex: cursor.CategoryIndex + 1}
-	}
-	if err := c.store.SetDiscoveryCursor(ctx, site.source, next.encode()); err != nil {
-		log.Printf("Could not save %s discovery cursor: %s\n", site.source, err)
-	}
-
-	if len(pages) == 0 {
-		logInfo("%s discovery: category %q returned no member pages (%d subcategories queued)", site.source, category, len(newlyQueued))
-		return topUpResult{calledNetwork: true}
-	}
-
-	priority := scoring.CalculatePriority(site.source, 0, 0)
-	urls := make([]string, len(pages))
-	for i, title := range pages {
-		urls[i] = wikiquoteTitleToURL(site, title)
-	}
-
-	// One batched INSERT + one batched ZADD for up to 500 URLs, instead of 500 of each awaited
-	// one at a time — the discovery batch size is exactly the case that made the old per-title
-	// loop expensive (~1000 sequential round-trips per top-up).
-	inserted, err := c.store.SaveURLsBatch(ctx, urls, site.source, priority, 0)
-	if err != nil {
-		log.Printf("Could not save discovered %s URLs: %s\n", site.source, err)
-		return topUpResult{calledNetwork: true}
-	}
-	if len(inserted) == 0 {
-		logInfo("%s discovery: category %q — fetched %d pages, added 0 new URLs to the frontier (all already known)", site.source, category, len(pages))
-		return topUpResult{calledNetwork: true}
-	}
-	if err := c.store.PushURLsBatch(ctx, site.source, inserted, priority); err != nil {
-		log.Printf("Could not push discovered %s URLs to frontier: %s\n", site.source, err)
-		return topUpResult{calledNetwork: true}
-	}
-	for _, u := range inserted {
-		logInfo("Discovered URL [%s]: %s (via category %q)", site.source, u, category)
-	}
-
-	logInfo("%s discovery: category %q — fetched %d pages, added %d new URLs to the frontier", site.source, category, len(pages), len(inserted))
-	return topUpResult{added: true, calledNetwork: true}
-}
-
-// topUpWikiquoteRandomPages queues a batch of random article titles (fetchWikiquoteRandomPages).
-// It's the feeder's mode once a full allpages pass found nothing new: it picks up articles
-// created since that pass, and any a pass missed. One request per call, same as every topUp.
+// topUpWikiquoteRandomPages is a Wikiquote feeder's topUp: one list=random call
+// (fetchWikiquoteRandomPages), queueing whichever of the 500 titles aren't known yet. The feeder
+// repeats it until it has the URLs it wants — see runFeeder's refill mode.
 func (c *Crawler) topUpWikiquoteRandomPages(ctx context.Context, site wikiquoteSite) topUpResult {
 	titles, err := fetchWikiquoteRandomPages(ctx, site)
 	if err != nil {
@@ -671,60 +456,7 @@ func (c *Crawler) topUpWikiquoteRandomPages(ctx context.Context, site wikiquoteS
 		return topUpResult{calledNetwork: true}
 	}
 	log.Printf("%s random: %d titles, %d new URLs queued", site.source, len(titles), len(inserted))
-	return topUpResult{added: true, calledNetwork: true}
-}
-
-// wikiquoteAllPagesCursorKey is where an edition's allpages continuation token is kept, apart
-// from its category-walk cursor (stored under the bare source name).
-func wikiquoteAllPagesCursorKey(site wikiquoteSite) string {
-	return site.source + ":allpages"
-}
-
-// topUpWikiquoteAllPages queues the next batch of the edition's full article list
-// (fetchWikiquoteAllPages), resuming from the stored token. passDone reports that this batch was
-// the last one; the token is then cleared, so the next pass starts again from the first title.
-// One request per call, same as every other topUp.
-func (c *Crawler) topUpWikiquoteAllPages(ctx context.Context, site wikiquoteSite) (result topUpResult, passDone bool) {
-	key := wikiquoteAllPagesCursorKey(site)
-	apContinue, err := c.store.GetDiscoveryCursor(ctx, key)
-	if err != nil {
-		log.Printf("Could not load %s allpages cursor: %s\n", site.source, err)
-		return topUpResult{}, false
-	}
-
-	titles, next, err := fetchWikiquoteAllPages(ctx, site, apContinue)
-	if err != nil {
-		log.Printf("%s allpages discovery failed: %s — backing off ~%s (jittered)\n", site.source, err, wikiquoteStallPenalty)
-		return topUpResult{calledNetwork: true, networkFailed: true, rateLimited: fetcher.IsRateLimited(err)}, false
-	}
-	if err := c.store.SetDiscoveryCursor(ctx, key, next); err != nil {
-		log.Printf("Could not save %s allpages cursor: %s\n", site.source, err)
-	}
-	passDone = next == ""
-
-	if len(titles) == 0 {
-		return topUpResult{calledNetwork: true}, passDone
-	}
-	priority := scoring.CalculatePriority(site.source, 0, 0)
-	urls := make([]string, len(titles))
-	for i, title := range titles {
-		urls[i] = wikiquoteTitleToURL(site, title)
-	}
-	inserted, err := c.store.SaveURLsBatch(ctx, urls, site.source, priority, 0)
-	if err != nil {
-		log.Printf("Could not save %s allpages URLs: %s\n", site.source, err)
-		return topUpResult{calledNetwork: true}, passDone
-	}
-	if len(inserted) == 0 {
-		logInfo("%s allpages: %d titles from %q, all already known", site.source, len(titles), titles[0])
-		return topUpResult{calledNetwork: true}, passDone
-	}
-	if err := c.store.PushURLsBatch(ctx, site.source, inserted, priority); err != nil {
-		log.Printf("Could not push %s allpages URLs to frontier: %s\n", site.source, err)
-		return topUpResult{calledNetwork: true}, passDone
-	}
-	log.Printf("%s allpages: %d titles from %q, %d new URLs queued", site.source, len(titles), titles[0], len(inserted))
-	return topUpResult{added: true, calledNetwork: true}, passDone
+	return topUpResult{added: true, calledNetwork: true, newURLs: len(inserted)}
 }
 
 // goodreadsTags is a curated fallback list of additional Goodreads quote tags, used only once
@@ -869,8 +601,8 @@ func (c *Crawler) failOrRetry(ctx context.Context, source string, row models.URL
 }
 
 // processURL fetches, parses, and saves everything for one URL — identical work regardless of
-// which source's worker goroutine calls it. Returns gotQuotes (fed into a Wikiquote worker's
-// dead-streak circuit breaker), newQuotes (how many quotes were actually saved, i.e. not
+// which source's worker goroutine calls it. Returns gotQuotes (whether the page had any
+// quotes at all), newQuotes (how many quotes were actually saved, i.e. not
 // duplicates — fed into Goodreads' dry-streak search trigger, see goodreads_discovery.go), stalled (true if
 // the fetch was slow-but-succeeded or hit a 429 — both real evidence of a source-wide problem,
 // telling the caller to back this source's whole cooldown off to stallPenaltyFor(source) instead
@@ -1079,9 +811,8 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 // fix for the crawler previously being single-threaded across all sources. Before this, every
 // source shared one loop: a single slow or stalled fetch (Goodreads' ~60s soft-throttle tarpit
 // is the known example) blocked the whole process, including a different source's fetch that
-// was already off cooldown and ready to go. Cooldown (lastFetch) and, for Wikiquote editions,
-// the dead-streak circuit breaker are both plain local variables — each is only ever touched by
-// the one goroutine that owns it. onResult, if non-nil, is handed whether the fetch yielded any
+// was already off cooldown and ready to go. Cooldown (lastFetch) is a plain local variable, only ever
+// touched by the one goroutine that owns it. onResult, if non-nil, is handed whether the fetch yielded any
 // quotes and how many of them were newly saved.
 //
 // The worker only fetches: keeping its queue filled is runFeeder's job, on a separate goroutine
@@ -1205,60 +936,6 @@ func (c *Crawler) abandonExperimentalPace(source string, current time.Duration) 
 	return safe
 }
 
-// wikiquoteTopUpFunc returns the feeder's topUp closure for site. It walks the curated category
-// tree (topUpWikiquoteCategories) until wikiquoteEmptyStreakBeforeAllPages calls in a row find
-// nothing new, then walks the edition's whole article list (topUpWikiquoteAllPages) to the end of
-// a pass. A pass that queued something goes straight back to the category walk. A pass that
-// queued nothing switches to random batches (topUpWikiquoteRandomPages) for
-// wikiquoteRandomModeSpan, at the feeder's normal pace, then starts the cycle over. Discovery
-// never pauses.
-//
-// All state is local to this closure, one per site, only touched from that site's feeder
-// goroutine. Failed calls don't count toward the streak: a rate-limited attempt isn't evidence
-// the edition is exhausted. Each call makes at most one request — see topUpResult.
-func (c *Crawler) wikiquoteTopUpFunc(site wikiquoteSite) func(ctx context.Context) topUpResult {
-	var emptyStreak int
-	var inAllPages, passAdded bool
-	var randomUntil time.Time
-	return func(ctx context.Context) topUpResult {
-		if time.Now().Before(randomUntil) {
-			return c.topUpWikiquoteRandomPages(ctx, site)
-		}
-
-		if inAllPages {
-			result, passDone := c.topUpWikiquoteAllPages(ctx, site)
-			passAdded = passAdded || result.added
-			if passDone {
-				inAllPages = false
-				if !passAdded {
-					randomUntil = time.Now().Add(wikiquoteRandomModeSpan)
-					log.Printf("%s: a full allpages pass found nothing new — switching to random batches until %s",
-						site.source, randomUntil.Format(time.RFC3339))
-				} else {
-					log.Printf("%s: allpages pass finished, back to the category walk", site.source)
-				}
-				passAdded = false
-			}
-			return result
-		}
-
-		result := c.topUpWikiquoteCategories(ctx, site)
-		if result.added {
-			emptyStreak = 0
-			return result
-		}
-		if result.calledNetwork && !result.networkFailed {
-			emptyStreak++
-		}
-		if emptyStreak >= wikiquoteEmptyStreakBeforeAllPages {
-			emptyStreak = 0
-			inAllPages = true
-			logWarn("%s: %d category-walk calls in a row found nothing new — walking the full article list", site.source, wikiquoteEmptyStreakBeforeAllPages)
-		}
-		return result
-	}
-}
-
 func (c *Crawler) Run(ctx context.Context) error {
 
 	quoteCount, err := c.store.CountQuotes(ctx)
@@ -1350,14 +1027,12 @@ func (c *Crawler) Run(ctx context.Context) error {
 		site := site
 		throttle := &sourceThrottle{}
 		go2(func() {
-			var deadStreak int
-			c.runWorker(ctx, site.source, wikiquoteExperimentalDelay, throttle,
-				func(gotQuotes bool, _ int) { deadStreak = c.recordWikiquoteYield(ctx, site, deadStreak, gotQuotes) },
-			)
+			c.runWorker(ctx, site.source, wikiquoteExperimentalDelay, throttle, nil)
 		})
 		go2(func() {
 			c.runFeeder(ctx, site.source, true, wikiquoteFeederDelay, wikiquoteExperimentalDelay, throttle,
-				c.frontierSizeFunc(site.source), nil, c.wikiquoteTopUpFunc(site))
+				c.frontierSizeFunc(site.source), nil,
+				func(ctx context.Context) topUpResult { return c.topUpWikiquoteRandomPages(ctx, site) })
 		})
 	}
 
@@ -1386,13 +1061,9 @@ func (c *Crawler) SeedFrontier(ctx context.Context) error {
 		{URL: goodreadsSeed, Source: scoring.SourceGoodreads, Priority: scoring.GoodreadsPriority(goodreadsSeed, 0)},
 	}
 
-	// WikiquoteParser has no NextURLs discovery of its own — real discovery comes from
-	// topUpWikiquoteCategories (MediaWiki categorymembers, see wikiquote_discovery.go) once
-	// this stopgap list runs out. Each URL here is one author page yielding many quotes from a
-	// single fetch, so this list lasts a while even before that kicks in. German has no
-	// equivalent stopgap list — category-based discovery already works well enough that a
-	// hand-picked German author list would just be redundant upfront research; it bootstraps
-	// straight from topUpWikiquoteCategories the first time the crawler goes idle.
+	// WikiquoteParser has no NextURLs discovery of its own — real discovery comes from the
+	// feeder's random batches (see wikiquote_discovery.go). This short English list just gives
+	// the first fetches something to do before the first batch lands.
 	wikiquotePriority := scoring.CalculatePriority(scoring.SourceWikiquoteEN, 0, 0)
 	wikiquoteAuthors := []string{
 		"Mark_Twain", "Oscar_Wilde", "Maya_Angelou", "Winston_Churchill", "Mahatma_Gandhi",

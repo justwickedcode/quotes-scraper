@@ -20,18 +20,19 @@ import (
 // Buffer levels, the same for every source (requested explicitly): the feeder tops a source's
 // queue up toward frontierTarget whenever it is below it. Once the queue falls to
 // frontierLowWater, the source enters refill mode: the worker stops fetching and the feeder runs
-// discovery at the worker's own pace, using the request budget the worker isn't, until the queue
-// is back at frontierMin. Refill also ends after refillMaxMisses discovery calls in a row add
-// nothing, or after refillMaxDuration, so a source that has genuinely run dry goes back to
-// fetching what it has instead of stalling on discovery.
+// discovery back to back at the worker's own pace (for Wikiquote, one list=random call of 500
+// titles each), using the request budget the worker isn't, until refillNewURLs new URLs have
+// been queued. Refill also ends after refillMaxMisses calls in a row add nothing (for Wikiquote,
+// 5,000 random titles all already known) or after refillMaxDuration, so an edition that really
+// is fully crawled goes back to fetching what it has instead of stalling on discovery.
 const (
 	frontierTarget    = 30
-	frontierMin       = 20
 	frontierLowWater  = 10
-	refillMaxMisses   = 3
-	refillMaxDuration = 2 * time.Minute
+	refillNewURLs     = 50
+	refillMaxMisses   = 10
+	refillMaxDuration = 5 * time.Minute
 
-	// refillCooldown: after a refill ends without restoring the buffer, the worker gets at least
+	// refillCooldown: after a refill ends short of refillNewURLs, the worker gets at least
 	// this long to fetch before the next refill can start, so a dry source doesn't flip straight
 	// back into refill mode and never fetch at all.
 	refillCooldown = 1 * time.Minute
@@ -122,14 +123,14 @@ func (c *Crawler) runFeeder(ctx context.Context, source string, networked bool, 
 
 	var refilling bool
 	var refillStart, noRefillUntil time.Time
-	var misses int
+	var misses, refillAdded int
 	endRefill := func(n int64, why string) {
 		refilling = false
 		throttle.setRefilling(false)
-		if n < frontierMin {
+		if refillAdded < refillNewURLs {
 			noRefillUntil = time.Now().Add(refillCooldown)
 		}
-		log.Printf("[%s] refill done (%s, %d queued) — back to fetching", source, why, n)
+		log.Printf("[%s] refill done (%s: %d new URLs, %d queued) — back to fetching", source, why, refillAdded, n)
 	}
 	defer throttle.setRefilling(false)
 
@@ -145,11 +146,11 @@ func (c *Crawler) runFeeder(ctx context.Context, source string, networked bool, 
 
 		switch {
 		case !refilling && n <= frontierLowWater && time.Now().After(noRefillUntil):
-			refilling, refillStart, misses = true, time.Now(), 0
+			refilling, refillStart, misses, refillAdded = true, time.Now(), 0, 0
 			throttle.setRefilling(networked)
 			log.Printf("[%s] only %d URL(s) queued — refilling before fetching more", source, n)
-		case refilling && n >= frontierMin:
-			endRefill(n, "buffer restored")
+		case refilling && refillAdded >= refillNewURLs:
+			endRefill(n, "got enough")
 		case refilling && misses >= refillMaxMisses:
 			endRefill(n, "discovery found nothing new")
 		case refilling && time.Since(refillStart) > refillMaxDuration:
@@ -176,6 +177,9 @@ func (c *Crawler) runFeeder(ctx context.Context, source string, networked bool, 
 		switch {
 		case result.added:
 			misses = 0
+			if refilling {
+				refillAdded += max(result.newURLs, 1)
+			}
 		case !result.networkFailed:
 			misses++
 		}
