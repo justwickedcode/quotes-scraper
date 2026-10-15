@@ -112,7 +112,7 @@ func (d *goodreadsDiscovery) onResult(ctx context.Context, gotQuotes bool, newQu
 	}
 }
 
-// topUp is the feeder's discovery step, called whenever goodreadsNeedsMore says the queue is
+// topUp is the feeder's discovery step, called whenever runFeeder decides the queue is
 // short. In order: the next keyword search, then searches for authors already collected from
 // other sources, then the curated tag list, then a random popular-quotes page once tags stop
 // finding anything. Everything here is Postgres/Redis only; no request goes to goodreads.com.

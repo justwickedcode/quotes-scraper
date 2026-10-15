@@ -341,6 +341,44 @@ func fetchWikiquoteAllPages(ctx context.Context, site wikiquoteSite, apContinue 
 	return titles, parsed.Continue.APContinue, nil
 }
 
+// wikiquoteRandomBatchSize: titles per list=random call — 500 is the anonymous maximum
+// (confirmed live: rnlimit=500 returns 500 titles with no warning).
+const wikiquoteRandomBatchSize = 500
+
+type wikiquoteRandomResponse struct {
+	Query struct {
+		Random []struct {
+			Title string `json:"title"`
+		} `json:"random"`
+	} `json:"query"`
+}
+
+// fetchWikiquoteRandomPages asks an edition's MediaWiki API for a batch of random article titles
+// (main namespace, redirects excluded). Draws can repeat across calls, so later batches are
+// mostly already-known titles; that's fine, SaveURLsBatch skips them.
+func fetchWikiquoteRandomPages(ctx context.Context, site wikiquoteSite) ([]string, error) {
+	apiURL := fmt.Sprintf(
+		"%s?action=query&list=random&rnnamespace=0&rnfilterredir=nonredirects&rnlimit=%d&format=json",
+		site.apiBase, wikiquoteRandomBatchSize,
+	)
+
+	body, err := fetcher.Fetch(ctx, apiURL)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed wikiquoteRandomResponse
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		return nil, err
+	}
+
+	titles := make([]string, 0, len(parsed.Query.Random))
+	for _, m := range parsed.Query.Random {
+		titles = append(titles, m.Title)
+	}
+	return titles, nil
+}
+
 // wikiquoteTitleToURL converts a MediaWiki page title, as returned by the API (spaces, not
 // underscores, and not URL-escaped), into that page's real URL on site.
 func wikiquoteTitleToURL(site wikiquoteSite, title string) string {

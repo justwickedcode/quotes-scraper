@@ -84,13 +84,11 @@ const (
 	// out a long streak to be confident that's really what's happening.
 	goodreadsEmptyStreakBeforeRandom = 3
 
-	// wikiquoteSaturatedRest: once a full allpages pass over an edition queues nothing new, every
-	// article it has is already known, and discovery goes dormant for this long — see
-	// wikiquoteTopUpFunc. Found live at ~2.7M quotes: exhausted editions re-walking known
-	// categories back to back, across fourteen editions, were enough traffic to trip 429s on all
-	// of them within seconds. Six hours cuts that to near nothing while still picking up newly
-	// created pages the same day.
-	wikiquoteSaturatedRest = 6 * time.Hour
+	// wikiquoteRandomModeSpan: once a full allpages pass over an edition queues nothing new, its
+	// feeder switches to list=random batches (see wikiquoteTopUpFunc) instead of pausing, and
+	// stays there this long before restarting the category walk and the next allpages pass.
+	// Requested explicitly over the earlier 6h pause ("go aggressive ... with /random").
+	wikiquoteRandomModeSpan = 1 * time.Hour
 
 	// goodreadsRandomPageMax bounds which page of Goodreads' own /quotes "popular quotes" listing
 	// topUpGoodreadsRandomPages picks from — confirmed live the listing paginates to page 100
@@ -123,6 +121,13 @@ const (
 	// and permanently abandoned per-source the instant a real 429 is observed at this pace — not
 	// something a human needs to be watching logs to catch.
 	wikiquoteExperimentalDelay = 5 * time.Second
+
+	// goodreadsExperimentalDelay: Goodreads is the highest-quality source and never runs out of
+	// content, so it starts at half its proven-safe 20s pace — requested explicitly ("goodreads
+	// should be first class priority"). Goodreads throttles by tarpitting (a slow 200 after
+	// ~60s), not with 429s, so the worker drops back to the safe pace on the first stalled fetch
+	// of any kind, not only on a 429 (see runWorker/abandonExperimentalPace).
+	goodreadsExperimentalDelay = 10 * time.Second
 )
 
 // minSourceDelayBySource lets sources that have actually shown throttling be treated more
@@ -635,6 +640,40 @@ func (c *Crawler) topUpWikiquoteCategories(ctx context.Context, site wikiquoteSi
 	return topUpResult{added: true, calledNetwork: true}
 }
 
+// topUpWikiquoteRandomPages queues a batch of random article titles (fetchWikiquoteRandomPages).
+// It's the feeder's mode once a full allpages pass found nothing new: it picks up articles
+// created since that pass, and any a pass missed. One request per call, same as every topUp.
+func (c *Crawler) topUpWikiquoteRandomPages(ctx context.Context, site wikiquoteSite) topUpResult {
+	titles, err := fetchWikiquoteRandomPages(ctx, site)
+	if err != nil {
+		log.Printf("%s random-page discovery failed: %s — backing off ~%s (jittered)\n", site.source, err, wikiquoteStallPenalty)
+		return topUpResult{calledNetwork: true, networkFailed: true, rateLimited: fetcher.IsRateLimited(err)}
+	}
+	if len(titles) == 0 {
+		return topUpResult{calledNetwork: true}
+	}
+	priority := scoring.CalculatePriority(site.source, 0, 0)
+	urls := make([]string, len(titles))
+	for i, title := range titles {
+		urls[i] = wikiquoteTitleToURL(site, title)
+	}
+	inserted, err := c.store.SaveURLsBatch(ctx, urls, site.source, priority, 0)
+	if err != nil {
+		log.Printf("Could not save random %s URLs: %s\n", site.source, err)
+		return topUpResult{calledNetwork: true}
+	}
+	if len(inserted) == 0 {
+		logInfo("%s random: %d titles, all already known", site.source, len(titles))
+		return topUpResult{calledNetwork: true}
+	}
+	if err := c.store.PushURLsBatch(ctx, site.source, inserted, priority); err != nil {
+		log.Printf("Could not push random %s URLs to frontier: %s\n", site.source, err)
+		return topUpResult{calledNetwork: true}
+	}
+	log.Printf("%s random: %d titles, %d new URLs queued", site.source, len(titles), len(inserted))
+	return topUpResult{added: true, calledNetwork: true}
+}
+
 // wikiquoteAllPagesCursorKey is where an edition's allpages continuation token is kept, apart
 // from its category-walk cursor (stored under the bare source name).
 func wikiquoteAllPagesCursorKey(site wikiquoteSite) string {
@@ -1046,7 +1085,8 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 // quotes and how many of them were newly saved.
 //
 // The worker only fetches: keeping its queue filled is runFeeder's job, on a separate goroutine
-// (see feeder.go). The two share throttle, so a 429 seen by either one pauses both.
+// (see feeder.go). The two share throttle, so a 429 seen by either one pauses both, and the
+// worker holds off while the feeder is in refill mode.
 //
 // Every wait point uses sleepCtx instead of time.Sleep and checks its result (or ctx.Err()
 // directly), so cancelling ctx (graceful shutdown — see Run) stops this loop within roughly one
@@ -1088,6 +1128,13 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 		if throttle.wait(ctx) {
 			return
 		}
+		// Refill mode (see feeder.go): the feeder is using this source's request budget for
+		// discovery, so hold off until it hands it back.
+		for throttle.isRefilling() {
+			if sleepCtx(ctx, time.Second) {
+				return
+			}
+		}
 		if throttle.takeRateLimited() {
 			minDelay = c.abandonExperimentalPace(source, minDelay)
 		}
@@ -1125,8 +1172,12 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 		gotQuotes, newQuotes, stalled, rateLimited := c.processURL(ctx, source, url)
 		if stalled {
 			lastFetch = lastFetch.Add(stallPenaltyFor(source) - minDelay)
-			if rateLimited {
+			// Goodreads signals throttling with slow responses rather than 429s, so any stall
+			// counts as the signal to leave its experimental pace.
+			if rateLimited || source == scoring.SourceGoodreads {
 				minDelay = c.abandonExperimentalPace(source, minDelay)
+			}
+			if rateLimited {
 				// Hold the feeder off this host for the same penalty.
 				throttle.backOff(stallPenaltyFor(source), false)
 			}
@@ -1144,22 +1195,23 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 // react to it. Only ever widens, never narrows back within the same process run: once real
 // evidence of rate-limiting shows up, there's no reason to risk finding it again in the same
 // run. A no-op if current is already at or above the safe pace (e.g. Goodreads, which never
-// runs at an experimental pace to begin with).
+// already widened by an earlier stall).
 func (c *Crawler) abandonExperimentalPace(source string, current time.Duration) time.Duration {
 	safe := minSourceDelayFor(source)
 	if current >= safe {
 		return current
 	}
-	log.Printf("[%s] Got rate-limited at the experimental %s pace — reverting to the proven-safe %s for the rest of this run", source, current, safe)
+	log.Printf("[%s] Throttled at the experimental %s pace — reverting to the proven-safe %s for the rest of this run", source, current, safe)
 	return safe
 }
 
 // wikiquoteTopUpFunc returns the feeder's topUp closure for site. It walks the curated category
 // tree (topUpWikiquoteCategories) until wikiquoteEmptyStreakBeforeAllPages calls in a row find
 // nothing new, then walks the edition's whole article list (topUpWikiquoteAllPages) to the end of
-// a pass before going back to categories. A full pass that queues nothing new means the edition
-// is fully crawled, and discovery goes dormant for wikiquoteSaturatedRest (the worker keeps
-// draining whatever is queued). On waking, the category walk resumes from its cursor.
+// a pass. A pass that queued something goes straight back to the category walk. A pass that
+// queued nothing switches to random batches (topUpWikiquoteRandomPages) for
+// wikiquoteRandomModeSpan, at the feeder's normal pace, then starts the cycle over. Discovery
+// never pauses.
 //
 // All state is local to this closure, one per site, only touched from that site's feeder
 // goroutine. Failed calls don't count toward the streak: a rate-limited attempt isn't evidence
@@ -1167,10 +1219,10 @@ func (c *Crawler) abandonExperimentalPace(source string, current time.Duration) 
 func (c *Crawler) wikiquoteTopUpFunc(site wikiquoteSite) func(ctx context.Context) topUpResult {
 	var emptyStreak int
 	var inAllPages, passAdded bool
-	var dormantUntil time.Time
+	var randomUntil time.Time
 	return func(ctx context.Context) topUpResult {
-		if time.Now().Before(dormantUntil) {
-			return topUpResult{}
+		if time.Now().Before(randomUntil) {
+			return c.topUpWikiquoteRandomPages(ctx, site)
 		}
 
 		if inAllPages {
@@ -1179,9 +1231,9 @@ func (c *Crawler) wikiquoteTopUpFunc(site wikiquoteSite) func(ctx context.Contex
 			if passDone {
 				inAllPages = false
 				if !passAdded {
-					dormantUntil = time.Now().Add(wikiquoteSaturatedRest)
-					log.Printf("%s: a full allpages pass found nothing new — edition looks fully crawled, pausing discovery until %s",
-						site.source, dormantUntil.Format(time.RFC3339))
+					randomUntil = time.Now().Add(wikiquoteRandomModeSpan)
+					log.Printf("%s: a full allpages pass found nothing new — switching to random batches until %s",
+						site.source, randomUntil.Format(time.RFC3339))
 				} else {
 					log.Printf("%s: allpages pass finished, back to the category walk", site.source)
 				}
@@ -1277,12 +1329,13 @@ func (c *Crawler) Run(ctx context.Context) error {
 	gdThrottle := &sourceThrottle{}
 	gd := &goodreadsDiscovery{c: c}
 	go2(func() {
-		c.runWorker(ctx, scoring.SourceGoodreads, minSourceDelayFor(scoring.SourceGoodreads), gdThrottle,
+		c.runWorker(ctx, scoring.SourceGoodreads, goodreadsExperimentalDelay, gdThrottle,
 			func(gotQuotes bool, newQuotes int) { gd.onResult(ctx, gotQuotes, newQuotes) },
 		)
 	})
 	go2(func() {
-		c.runFeeder(ctx, scoring.SourceGoodreads, 0, gdThrottle, c.goodreadsNeedsMore, gd.topUp)
+		c.runFeeder(ctx, scoring.SourceGoodreads, false, 0, 0, gdThrottle,
+			c.frontierSizeFunc(scoring.SourceGoodreads), c.goodreadsNeedsSearches, gd.topUp)
 	})
 
 	// Every Wikiquote edition starts at wikiquoteExperimentalDelay rather than its proven-safe
@@ -1303,7 +1356,8 @@ func (c *Crawler) Run(ctx context.Context) error {
 			)
 		})
 		go2(func() {
-			c.runFeeder(ctx, site.source, wikiquoteFeederDelay, throttle, c.wikiquoteNeedsMore(site.source), c.wikiquoteTopUpFunc(site))
+			c.runFeeder(ctx, site.source, true, wikiquoteFeederDelay, wikiquoteExperimentalDelay, throttle,
+				c.frontierSizeFunc(site.source), nil, c.wikiquoteTopUpFunc(site))
 		})
 	}
 
