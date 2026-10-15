@@ -150,6 +150,19 @@ func (s *Store) PopURL(ctx context.Context, source string) (string, error) {
 	return results[0].Member.(string), nil
 }
 
+// FrontierSize returns how many URLs are sitting in source's Redis queue, ready to pop. Cheaper
+// than CountPendingBySource (one ZCARD, no Postgres) and closer to what a feeder cares about:
+// URLs held back as delayed retries aren't in the queue and can't be fetched yet anyway.
+func (s *Store) FrontierSize(ctx context.Context, source string) (int64, error) {
+	return s.rdb.ZCard(ctx, frontierKey(source)).Result()
+}
+
+// FrontierCountByPriority returns how many queued URLs for source have a priority in [min, max].
+func (s *Store) FrontierCountByPriority(ctx context.Context, source string, min, max float64) (int64, error) {
+	return s.rdb.ZCount(ctx, frontierKey(source),
+		strconv.FormatFloat(min, 'f', -1, 64), strconv.FormatFloat(max, 'f', -1, 64)).Result()
+}
+
 // isNearDuplicate checks LSH bands in Redis, runs Hamming only on candidates
 func (s *Store) isNearDuplicate(ctx context.Context, simhash int64) (bool, error) {
 	bands := dedup.ExtractBands(simhash)
@@ -659,6 +672,40 @@ func (s *Store) CountPendingBySource(ctx context.Context, source string) (int64,
 		source,
 	).Scan(&count)
 	return count, err
+}
+
+// QuoteAuthorsAfter scans quotes by id, starting after afterID, and returns the distinct
+// non-empty authors among the next limit rows not from excludeSource, plus the last id scanned
+// (afterID when nothing is left). Walking by primary key keeps each call an index range scan no
+// matter how large the table gets, and rows appended later are picked up by the same cursor.
+func (s *Store) QuoteAuthorsAfter(ctx context.Context, afterID int64, limit int, excludeSource string) ([]string, int64, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, COALESCE(author, '') FROM quotes WHERE id > $1 AND source <> $2 ORDER BY id LIMIT $3`,
+		afterID, excludeSource, limit,
+	)
+	if err != nil {
+		return nil, afterID, err
+	}
+	defer rows.Close()
+
+	lastID := afterID
+	seen := make(map[string]bool)
+	var authors []string
+	for rows.Next() {
+		var id int64
+		var author string
+		if err := rows.Scan(&id, &author); err != nil {
+			return nil, afterID, err
+		}
+		lastID = id
+		author = strings.TrimSpace(author)
+		if author == "" || seen[author] {
+			continue
+		}
+		seen[author] = true
+		authors = append(authors, author)
+	}
+	return authors, lastID, rows.Err()
 }
 
 // discoveryCursorKey namespaces continuation-token storage in Redis by source, so each

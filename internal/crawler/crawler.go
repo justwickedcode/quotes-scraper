@@ -68,48 +68,29 @@ const (
 	// discovery, not a replacement for it.
 	wikiquoteDeadStreakThreshold = 5
 
-	// minFrontierBuffer: a source's own topUp is only skipped once its pending count reaches
-	// this many — requested explicitly ("when you have none anymore, focus on filling that
-	// queue... aggressive on filling the queue"). Previously topUp for a source was skipped the
-	// instant even a single URL was pending, so a source spent almost all its time fetching
-	// pages one at a time and only ever topped up in the rare iteration its queue had *fully*
-	// drained to zero — fine once a source has a healthy backlog, but slow to rebuild one from
-	// scratch. Below this buffer, runWorker prioritizes discovery over fetching (still falling
-	// through to fetch whatever's already pending if topUp itself has nothing more to add right
-	// now, so quote processing never fully stops) until the buffer is rebuilt; at or above it,
-	// behavior is exactly the old "only top up when truly empty" pace.
-	minFrontierBuffer = 20
+	// wikiquoteEmptyStreakBeforeAllPages: after this many consecutive category-walk calls in a
+	// row add zero new URLs (the curated walk, including its recursive subcategory descent, has
+	// nothing new right then), discovery switches to walking the edition's full article list
+	// (list=allpages) until that pass ends — see wikiquoteTopUpFunc. Kept low (it used to be 10)
+	// because the smaller localized editions exhaust their few curated categories quickly —
+	// confirmed live, French once had a 94-minute gap with zero new quotes.
+	wikiquoteEmptyStreakBeforeAllPages = 2
 
-	// wikiquoteEmptyStreakBeforeRandom: after this many consecutive top-up calls in a row add
-	// zero new URLs (the curated category walk, including its recursive subcategory descent,
-	// genuinely finding nothing new right then), fall back to topUpWikiquoteRandomPages once.
-	// Lowered from 10 to 2 at the user's explicit request: the smaller localized editions (2-3
-	// curated categories each, vs English's 23) exhaust and start cycling back through
-	// already-known categories much faster than English/German ever did, so waiting for 10
-	// consecutive misses left them sitting idle far longer than necessary — confirmed live,
-	// French had a 94-minute gap with zero new quotes. Distinct from wikiquoteDeadStreakThreshold,
-	// which counts consecutive zero-*quote* page fetches (pages already in the queue yielding
-	// nothing), not consecutive *discovery* calls finding nothing new to queue in the first place.
-	wikiquoteEmptyStreakBeforeRandom = 2
-
-	// goodreadsEmptyStreakBeforeRandom is Goodreads' equivalent of wikiquoteEmptyStreakBeforeRandom:
-	// after this many consecutive tag-cycling attempts in a row add nothing new (every tag in
-	// goodreadsTags already seeded at least once — see topUpGoodreadsIfEmpty), fall back to
+	// goodreadsEmptyStreakBeforeRandom: after this many consecutive tag-cycling attempts in a row add nothing new (every tag in
+	// goodreadsTags already seeded at least once — see topUpGoodreadsTag), fall back to
 	// topUpGoodreadsRandomPages once. Goodreads' curated tag list is much shorter than any
 	// Wikiquote edition's category list (19 tags vs. tens of categories), so once it's dry it
 	// stays dry every single call from then on, not just occasionally — there's no need to wait
 	// out a long streak to be confident that's really what's happening.
 	goodreadsEmptyStreakBeforeRandom = 3
 
-	// wikiquoteSaturationRandomMisses / wikiquoteSaturatedRest: how many random-page batches in a
-	// row must come back entirely already-known before an edition is treated as fully crawled,
-	// and how long its discovery then stays dormant — see wikiquoteTopUpFunc. Three batches is
-	// 150 random titles with zero unknowns; if even 2% of an edition's articles were still
-	// unknown, that would happen by chance only ~5% of the time, so it's a cheap but meaningful
-	// signal. Six hours is long enough to cut discovery traffic to near nothing for an exhausted
-	// edition, short enough that newly created pages still get picked up the same day.
-	wikiquoteSaturationRandomMisses = 3
-	wikiquoteSaturatedRest          = 6 * time.Hour
+	// wikiquoteSaturatedRest: once a full allpages pass over an edition queues nothing new, every
+	// article it has is already known, and discovery goes dormant for this long — see
+	// wikiquoteTopUpFunc. Found live at ~2.7M quotes: exhausted editions re-walking known
+	// categories back to back, across fourteen editions, were enough traffic to trip 429s on all
+	// of them within seconds. Six hours cuts that to near nothing while still picking up newly
+	// created pages the same day.
+	wikiquoteSaturatedRest = 6 * time.Hour
 
 	// goodreadsRandomPageMax bounds which page of Goodreads' own /quotes "popular quotes" listing
 	// topUpGoodreadsRandomPages picks from — confirmed live the listing paginates to page 100
@@ -440,16 +421,13 @@ func formatCount(n int64) string {
 	return out
 }
 
-// topUpResult is what a source's top-up function reports back to runWorker. calledNetwork
+// topUpResult is what a source's top-up function reports back to runFeeder. calledNetwork
 // distinguishes a real HTTP request to the source (Wikiquote's MediaWiki API calls) from a
-// pure DB/Redis operation (Goodreads' tag-seeding, which never calls goodreads.com itself
-// during top-up) — only the former should consume this source's per-fetch cooldown slot the
-// same way a page fetch does. Found live: consecutive Wikiquote discovery calls (walking past
-// several already-fully-known categories, each a fast "0 new URLs" response) were completely
-// unthrottled — only the flat idlePollInterval (2s) separated them, not the source's real 6s
-// cooldown — and hit a 429 from Wikiquote's API as a direct result. Page fetches never had this
-// problem because they were always gated by lastFetch/minDelay; discovery calls bypassed that
-// gate entirely by being called from a different branch that didn't update it.
+// pure DB/Redis operation (Goodreads' seeding, which never calls goodreads.com itself) — only
+// the former is paced by the feeder's delay. Found live, back when discovery ran inside the
+// fetch loop: consecutive Wikiquote discovery calls (walking past several already-fully-known
+// categories, each a fast "0 new URLs" response) were separated only by a flat 2s poll, not a
+// real cooldown, and hit a 429 from Wikiquote's API as a direct result.
 type topUpResult struct {
 	added         bool
 	calledNetwork bool
@@ -494,7 +472,7 @@ func (c *Crawler) recordWikiquoteYield(ctx context.Context, site wikiquoteSite, 
 		return 0
 	}
 	cursor := decodeWikiquoteCursor(raw)
-	// Same out-of-range guard topUpWikiquoteSiteIfEmpty already applies when *reading* a
+	// Same out-of-range guard topUpWikiquoteCategories already applies when *reading* a
 	// cursor — needed here too, on the *write* path, or a run of dead-streak skips can push
 	// CategoryIndex arbitrarily far past the curated list's length before the next top-up call
 	// happens to catch and reset it. Purely cosmetic in the meantime (topUp's own guard means
@@ -523,9 +501,8 @@ func (c *Crawler) recordWikiquoteYield(ctx context.Context, site wikiquoteSite, 
 	return 0
 }
 
-// topUpWikiquoteSiteIfEmpty checks whether the given Wikiquote edition has any pending work;
-// if not, fetches the next batch of one of its curated categories via the MediaWiki API and
-// seeds it. Returns true if new work was actually added. This is what keeps a Wikiquote
+// topUpWikiquoteCategories fetches the next batch of one of the edition's curated categories via
+// the MediaWiki API and queues it. The feeder (see feeder.go) decides when that's needed. This is what keeps a Wikiquote
 // edition from running dry mid-session — the fixed stopgap seed list (English only) only
 // lasts ~20 pages, and SeedFrontier only runs once at startup, so without this the crawler
 // would just sit idle once that list was consumed, even with real content still available to
@@ -541,17 +518,8 @@ func (c *Crawler) recordWikiquoteYield(ctx context.Context, site wikiquoteSite, 
 // starts over — Wikiquote gains new articles over time, so a full pass eventually finds fresh
 // content again; in the meantime it's a cheap no-op (ON CONFLICT DO NOTHING skips everything
 // already known, so `added` stays 0 and the caller's dead-end fallback — see
-// topUpGoodreadsIfEmpty — takes over instead of this looping forever on stale data).
-func (c *Crawler) topUpWikiquoteSiteIfEmpty(ctx context.Context, site wikiquoteSite) topUpResult {
-	pending, err := c.store.CountPendingBySource(ctx, site.source)
-	if err != nil {
-		log.Printf("Could not check %s pending count: %s\n", site.source, err)
-		return topUpResult{}
-	}
-	if pending >= minFrontierBuffer {
-		return topUpResult{}
-	}
-
+// topUpGoodreadsTag — takes over instead of this looping forever on stale data).
+func (c *Crawler) topUpWikiquoteCategories(ctx context.Context, site wikiquoteSite) topUpResult {
 	raw, err := c.store.GetDiscoveryCursor(ctx, site.source)
 	if err != nil {
 		log.Printf("Could not load %s discovery cursor: %s\n", site.source, err)
@@ -667,50 +635,57 @@ func (c *Crawler) topUpWikiquoteSiteIfEmpty(ctx context.Context, site wikiquoteS
 	return topUpResult{added: true, calledNetwork: true}
 }
 
-// topUpWikiquoteRandomPages is the dead-end fallback for a Wikiquote edition: fetches a batch
-// of genuinely random article titles instead of walking the curated category tree. Called by
-// runWikiquoteWorker (see Run) after wikiquoteEmptyStreakBeforeRandom consecutive top-up calls
-// in a row added nothing — confirmed live this is a real, not hypothetical, scenario (German
-// Wikiquote's queue emptied out mid-way through a large already-mostly-known subcategory
-// branch). Doesn't touch the category-walk cursor at all — it's a one-off injection of extra
-// candidate URLs on top of, not a replacement for, the normal discovery cursor, which resumes
-// exactly where it left off on the next call once this fallback returns.
-func (c *Crawler) topUpWikiquoteRandomPages(ctx context.Context, site wikiquoteSite) topUpResult {
-	titles, err := fetchWikiquoteRandomPages(ctx, site)
+// wikiquoteAllPagesCursorKey is where an edition's allpages continuation token is kept, apart
+// from its category-walk cursor (stored under the bare source name).
+func wikiquoteAllPagesCursorKey(site wikiquoteSite) string {
+	return site.source + ":allpages"
+}
+
+// topUpWikiquoteAllPages queues the next batch of the edition's full article list
+// (fetchWikiquoteAllPages), resuming from the stored token. passDone reports that this batch was
+// the last one; the token is then cleared, so the next pass starts again from the first title.
+// One request per call, same as every other topUp.
+func (c *Crawler) topUpWikiquoteAllPages(ctx context.Context, site wikiquoteSite) (result topUpResult, passDone bool) {
+	key := wikiquoteAllPagesCursorKey(site)
+	apContinue, err := c.store.GetDiscoveryCursor(ctx, key)
 	if err != nil {
-		log.Printf("%s random-page fallback failed: %s — backing off ~%s (jittered)\n", site.source, err, wikiquoteStallPenalty)
-		return topUpResult{calledNetwork: true, networkFailed: true, rateLimited: fetcher.IsRateLimited(err)}
-	}
-	if len(titles) == 0 {
-		logWarn("%s random-page fallback returned no titles", site.source)
-		return topUpResult{calledNetwork: true}
+		log.Printf("Could not load %s allpages cursor: %s\n", site.source, err)
+		return topUpResult{}, false
 	}
 
+	titles, next, err := fetchWikiquoteAllPages(ctx, site, apContinue)
+	if err != nil {
+		log.Printf("%s allpages discovery failed: %s — backing off ~%s (jittered)\n", site.source, err, wikiquoteStallPenalty)
+		return topUpResult{calledNetwork: true, networkFailed: true, rateLimited: fetcher.IsRateLimited(err)}, false
+	}
+	if err := c.store.SetDiscoveryCursor(ctx, key, next); err != nil {
+		log.Printf("Could not save %s allpages cursor: %s\n", site.source, err)
+	}
+	passDone = next == ""
+
+	if len(titles) == 0 {
+		return topUpResult{calledNetwork: true}, passDone
+	}
 	priority := scoring.CalculatePriority(site.source, 0, 0)
 	urls := make([]string, len(titles))
 	for i, title := range titles {
 		urls[i] = wikiquoteTitleToURL(site, title)
 	}
-
 	inserted, err := c.store.SaveURLsBatch(ctx, urls, site.source, priority, 0)
 	if err != nil {
-		log.Printf("Could not save random %s URLs: %s\n", site.source, err)
-		return topUpResult{calledNetwork: true}
+		log.Printf("Could not save %s allpages URLs: %s\n", site.source, err)
+		return topUpResult{calledNetwork: true}, passDone
 	}
 	if len(inserted) == 0 {
-		logInfo("%s random-page fallback: fetched %d titles, added 0 new URLs (all already known)", site.source, len(titles))
-		return topUpResult{calledNetwork: true}
+		logInfo("%s allpages: %d titles from %q, all already known", site.source, len(titles), titles[0])
+		return topUpResult{calledNetwork: true}, passDone
 	}
 	if err := c.store.PushURLsBatch(ctx, site.source, inserted, priority); err != nil {
-		log.Printf("Could not push random %s URLs to frontier: %s\n", site.source, err)
-		return topUpResult{calledNetwork: true}
+		log.Printf("Could not push %s allpages URLs to frontier: %s\n", site.source, err)
+		return topUpResult{calledNetwork: true}, passDone
 	}
-	for _, u := range inserted {
-		logInfo("Discovered URL [%s]: %s (via random-page fallback)", site.source, u)
-	}
-
-	logInfo("%s random-page fallback: fetched %d titles, added %d new URLs to the frontier", site.source, len(titles), len(inserted))
-	return topUpResult{added: true, calledNetwork: true}
+	log.Printf("%s allpages: %d titles from %q, %d new URLs queued", site.source, len(titles), titles[0], len(inserted))
+	return topUpResult{added: true, calledNetwork: true}, passDone
 }
 
 // goodreadsTags is a curated fallback list of additional Goodreads quote tags, used only once
@@ -723,26 +698,12 @@ var goodreadsTags = []string{
 	"courage", "hope", "faith", "dreams", "change",
 }
 
-// topUpGoodreadsIfEmpty checks whether Goodreads has any pending work; if not, seeds the next
-// tag from goodreadsTags (cycling back to the start once exhausted — a cheap no-op via
-// ON CONFLICT DO NOTHING if that tag's pagination was already fully crawled, not a real
-// problem). This is the dead-end fallback: if both sources' primary discovery genuinely have
-// nothing new right now, this is what keeps the crawler finding real work instead of just
-// idling forever.
-// topUpGoodreadsIfEmpty never sets calledNetwork on its topUpResult — unlike Wikiquote's
-// top-up, this only ever touches Postgres/Redis (seeding a tag URL for the normal fetch loop
-// to pick up later); it doesn't fetch goodreads.com itself, so it shouldn't consume Goodreads'
-// per-fetch cooldown slot the way a real request would.
-func (c *Crawler) topUpGoodreadsIfEmpty(ctx context.Context) topUpResult {
-	pending, err := c.store.CountPendingBySource(ctx, scoring.SourceGoodreads)
-	if err != nil {
-		log.Printf("Could not check Goodreads pending count: %s\n", err)
-		return topUpResult{}
-	}
-	if pending > 0 {
-		return topUpResult{}
-	}
-
+// topUpGoodreadsTag seeds the next tag from goodreadsTags (cycling back to the start once
+// exhausted — a cheap no-op via ON CONFLICT DO NOTHING if that tag's pagination was already fully
+// crawled). One of the Goodreads feeder's fallbacks, see goodreadsDiscovery.topUp.
+// It never sets calledNetwork on its topUpResult: it only touches Postgres/Redis (seeding a tag
+// URL for the worker to fetch later), never goodreads.com itself.
+func (c *Crawler) topUpGoodreadsTag(ctx context.Context) topUpResult {
 	idx := 0
 	if raw, err := c.store.GetDiscoveryCursor(ctx, scoring.SourceGoodreads); err == nil && raw != "" {
 		if n, err := strconv.Atoi(raw); err == nil {
@@ -775,7 +736,7 @@ func (c *Crawler) topUpGoodreadsIfEmpty(ctx context.Context) topUpResult {
 }
 
 // topUpGoodreadsRandomPages is Goodreads' equivalent of topUpWikiquoteRandomPages: the dead-end
-// fallback once even topUpGoodreadsIfEmpty's tag cycling stops finding anything new (every tag
+// fallback once even topUpGoodreadsTag's tag cycling stops finding anything new (every tag
 // in goodreadsTags already seeded — see goodreadsEmptyStreakBeforeRandom). Rather than a
 // MediaWiki list=random call (Goodreads has no equivalent API), this seeds a random page of
 // https://www.goodreads.com/quotes — the site's own "popular quotes" listing, which paginates to
@@ -783,7 +744,7 @@ func (c *Crawler) topUpGoodreadsIfEmpty(ctx context.Context) topUpResult {
 // already parses for tag/author pages (confirmed live), so no parser changes are needed: the
 // normal fetch loop picks this URL up like any other Goodreads URL, and its own NextURLs (tags
 // and author links, same as any other page) feed straight back into the organic discovery this
-// is backing up. Like topUpGoodreadsIfEmpty, this never touches goodreads.com itself (only
+// is backing up. Like topUpGoodreadsTag, this never touches goodreads.com itself (only
 // Postgres/Redis via SaveURL/PushURL), so topUpResult.calledNetwork stays false here too.
 func (c *Crawler) topUpGoodreadsRandomPages(ctx context.Context) topUpResult {
 	page := rand.Intn(goodreadsRandomPageMax) + 1
@@ -1080,11 +1041,12 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 // source shared one loop: a single slow or stalled fetch (Goodreads' ~60s soft-throttle tarpit
 // is the known example) blocked the whole process, including a different source's fetch that
 // was already off cooldown and ready to go. Cooldown (lastFetch) and, for Wikiquote editions,
-// the dead-streak circuit breaker are both plain local variables now instead of fields shared
-// across sources — each is only ever touched by the one goroutine that owns it, so there's
-// nothing to lock. topUp is called whenever this source's queue is empty (nil for a source
-// with no top-up mechanism); onResult, if non-nil, is handed whether the fetch yielded any
-// quotes and how many of them were newly saved, for the Wikiquote dead-streak logic to update its own local streak.
+// the dead-streak circuit breaker are both plain local variables — each is only ever touched by
+// the one goroutine that owns it. onResult, if non-nil, is handed whether the fetch yielded any
+// quotes and how many of them were newly saved.
+//
+// The worker only fetches: keeping its queue filled is runFeeder's job, on a separate goroutine
+// (see feeder.go). The two share throttle, so a 429 seen by either one pauses both.
 //
 // Every wait point uses sleepCtx instead of time.Sleep and checks its result (or ctx.Err()
 // directly), so cancelling ctx (graceful shutdown — see Run) stops this loop within roughly one
@@ -1092,27 +1054,18 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 // pending. fetcher.Fetch itself is also ctx-aware, so even a fetch already in flight when
 // shutdown is requested gets cut short instead of running out its full 90s timeout.
 //
-// topUp's calledNetwork/networkFailed (see topUpResult) update lastFetch exactly like a page
-// fetch would — found live that without this, consecutive Wikiquote discovery calls (each its
-// own real HTTP request to the MediaWiki API) had no cooldown between them at all beyond the
-// flat idlePollInterval, and a run of several already-exhausted categories in a row hit a 429
-// as a direct result. Goodreads' top-up never sets calledNetwork (it only touches
-// Postgres/Redis), so it correctly never eats into Goodreads' cooldown for no reason.
-//
 // minDelay starts as whatever the caller passes in (the proven-safe value for Goodreads, or
 // the deliberately narrower wikiquoteExperimentalDelay for a Wikiquote worker) but is a plain
 // local variable, not a fixed parameter — abandonExperimentalPace can permanently widen it mid-run
-// the instant a real 429 shows up, without needing any state shared outside this one goroutine.
-func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Duration, topUp func(ctx context.Context) topUpResult, onResult func(gotQuotes bool, newQuotes int)) {
+// the instant a real 429 shows up.
+func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Duration, throttle *sourceThrottle, onResult func(gotQuotes bool, newQuotes int)) {
 	// A random startup stagger for every Wikiquote worker (not Goodreads — a single stream has
 	// no herd to desynchronize) — found live: all fourteen goroutines start in the same instant,
-	// so their very first discovery call collides immediately, before any retry jitter ever gets
+	// so their very first request collides immediately, before any retry jitter ever gets
 	// a chance to matter (confirmed live at startup, twice: three editions 429'd within the same
 	// second with a 5s spread window; still five within the same second after widening to that
 	// 5s window, given ~12 sources landing across it — bumped to 15s for a meaningfully lower
-	// per-second collision rate). Spreads the *first* attempt out instead of firing them all at
-	// once; doesn't eliminate the underlying shared rate limit, just reduces how often several
-	// sources' first requests land in the same instant.
+	// per-second collision rate).
 	if source != scoring.SourceGoodreads {
 		if sleepCtx(ctx, time.Duration(rand.Float64()*float64(15*time.Second))) {
 			return
@@ -1132,6 +1085,12 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 				}
 			}
 		}
+		if throttle.wait(ctx) {
+			return
+		}
+		if throttle.takeRateLimited() {
+			minDelay = c.abandonExperimentalPace(source, minDelay)
+		}
 
 		// Move any of this source's delayed retries (see failOrRetry/hardFailureRetryDelay)
 		// whose hold has expired back onto the live frontier, so PopURL below can actually pick
@@ -1141,36 +1100,6 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 			log.Printf("[%s] Could not promote due delayed retries: %s\n", source, err)
 		} else if promoted > 0 {
 			logInfo("[%s] Promoted %d delayed retry URL(s) back onto the frontier", source, promoted)
-		}
-
-		// Aggressive-fill: below minFrontierBuffer, try topUp *before* checking whether
-		// there's already something pending to fetch, not only once the queue is fully
-		// empty — see that constant's doc comment. topUp itself still correctly no-ops
-		// (Goodreads: pending > 0; Wikiquote: pending >= minFrontierBuffer) so this is a
-		// harmless extra check once a source's buffer is actually healthy, and for Goodreads
-		// specifically (a single pagination chain, never meant to hold many pending URLs at
-		// once) it's always a no-op past its own gate.
-		if topUp != nil {
-			pending, err := c.store.CountPendingBySource(ctx, source)
-			if err != nil {
-				log.Printf("[%s] Could not check pending count: %s\n", source, err)
-			} else if pending < minFrontierBuffer {
-				result := topUp(ctx)
-				if result.calledNetwork {
-					if result.networkFailed {
-						lastFetch = time.Now().Add(stallPenaltyFor(source) - minDelay)
-						if result.rateLimited {
-							minDelay = c.abandonExperimentalPace(source, minDelay)
-						}
-					} else {
-						lastFetch = time.Now()
-					}
-					continue
-				}
-				// topUp had nothing to add this round (already at its own limit, or a
-				// genuine no-op) — fall through and fetch whatever's already pending instead
-				// of idling, so quote processing keeps going while the buffer rebuilds.
-			}
 		}
 
 		url, err := c.store.PopURL(ctx, source)
@@ -1185,30 +1114,7 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 			continue
 		}
 		if url == "" {
-			if topUp != nil {
-				result := topUp(ctx)
-				if result.calledNetwork {
-					if result.networkFailed {
-						lastFetch = time.Now().Add(stallPenaltyFor(source) - minDelay)
-						if result.rateLimited {
-							minDelay = c.abandonExperimentalPace(source, minDelay)
-						}
-					} else {
-						lastFetch = time.Now()
-					}
-					// A real network request was just made (whether it found new work, found
-					// nothing, or failed) — the per-source cooldown just set above is what
-					// paces the next one; piling idlePollInterval on top of it here was pure
-					// waste, and it's exactly this wasted gap that made a chain of empty
-					// categories/subcategories (recursive discovery, see wikiquote_discovery.go)
-					// feel needlessly slow. Loop straight back to the top-of-loop cooldown wait
-					// instead of sleeping twice.
-					continue
-				}
-				if result.added {
-					continue
-				}
-			}
+			// Nothing queued: the feeder is working on it (or the source is exhausted for now).
 			if sleepCtx(ctx, idlePollInterval) {
 				return
 			}
@@ -1221,6 +1127,8 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 			lastFetch = lastFetch.Add(stallPenaltyFor(source) - minDelay)
 			if rateLimited {
 				minDelay = c.abandonExperimentalPace(source, minDelay)
+				// Hold the feeder off this host for the same penalty.
+				throttle.backOff(stallPenaltyFor(source), false)
 			}
 		}
 		if onResult != nil {
@@ -1246,68 +1154,54 @@ func (c *Crawler) abandonExperimentalPace(source string, current time.Duration) 
 	return safe
 }
 
-// wikiquoteTopUpFunc returns a topUp closure for site: the normal curated-category walk
-// (topUpWikiquoteSiteIfEmpty), falling back to a batch of genuinely random pages
-// (topUpWikiquoteRandomPages) once wikiquoteEmptyStreakBeforeRandom consecutive calls in a row
-// find nothing new to queue. All state is local to this closure (one per site, since each
-// Wikiquote edition's worker gets its own call to this function). Only calls that actually
-// completed without a network error count toward either streak — a failed/rate-limited attempt
-// isn't evidence the edition is exhausted.
+// wikiquoteTopUpFunc returns the feeder's topUp closure for site. It walks the curated category
+// tree (topUpWikiquoteCategories) until wikiquoteEmptyStreakBeforeAllPages calls in a row find
+// nothing new, then walks the edition's whole article list (topUpWikiquoteAllPages) to the end of
+// a pass before going back to categories. A full pass that queues nothing new means the edition
+// is fully crawled, and discovery goes dormant for wikiquoteSaturatedRest (the worker keeps
+// draining whatever is queued). On waking, the category walk resumes from its cursor.
 //
-// The random fallback runs on the *next* call, not in the same call as the discovery request
-// that tripped the streak — found live that doing both in one call fired two MediaWiki API
-// requests ~150ms apart, breaking the one-request-per-topUp invariant runWorker's cooldown
-// relies on (see wikiquoteDiscoveryCursor) and doubling the request rate exactly when an
-// edition had nothing left to find.
-//
-// Saturation: once wikiquoteSaturationRandomMisses random batches in a row come back with every
-// title already known, the edition is treated as fully crawled and topUp goes dormant for
-// wikiquoteSaturatedRest — returning a no-op, so the worker still drains whatever is already
-// pending but makes no discovery requests at all. Found live at ~2.7M quotes: every edition was
-// re-walking already-known categories and random pages back to back, ~2 API calls per cooldown
-// per edition for zero new URLs, enough aggregate volume across fourteen editions to trip 429s on
-// all of them within the same few seconds. On waking, the category walk resumes from its cursor,
-// which is what eventually picks up pages created in the meantime.
+// All state is local to this closure, one per site, only touched from that site's feeder
+// goroutine. Failed calls don't count toward the streak: a rate-limited attempt isn't evidence
+// the edition is exhausted. Each call makes at most one request — see topUpResult.
 func (c *Crawler) wikiquoteTopUpFunc(site wikiquoteSite) func(ctx context.Context) topUpResult {
-	var emptyStreak, fruitlessRandom int
-	var randomDue bool
+	var emptyStreak int
+	var inAllPages, passAdded bool
 	var dormantUntil time.Time
 	return func(ctx context.Context) topUpResult {
 		if time.Now().Before(dormantUntil) {
 			return topUpResult{}
 		}
 
-		if randomDue {
-			randomDue = false
-			result := c.topUpWikiquoteRandomPages(ctx, site)
-			switch {
-			case result.added:
-				fruitlessRandom = 0
-			case result.calledNetwork && !result.networkFailed:
-				fruitlessRandom++
-				if fruitlessRandom >= wikiquoteSaturationRandomMisses {
-					fruitlessRandom = 0
+		if inAllPages {
+			result, passDone := c.topUpWikiquoteAllPages(ctx, site)
+			passAdded = passAdded || result.added
+			if passDone {
+				inAllPages = false
+				if !passAdded {
 					dormantUntil = time.Now().Add(wikiquoteSaturatedRest)
-					log.Printf("%s: %d random batches in a row (%d titles) were all already known — edition looks fully crawled, pausing discovery until %s",
-						site.source, wikiquoteSaturationRandomMisses, wikiquoteSaturationRandomMisses*wikiquoteRandomBatchSize, dormantUntil.Format(time.RFC3339))
+					log.Printf("%s: a full allpages pass found nothing new — edition looks fully crawled, pausing discovery until %s",
+						site.source, dormantUntil.Format(time.RFC3339))
+				} else {
+					log.Printf("%s: allpages pass finished, back to the category walk", site.source)
 				}
+				passAdded = false
 			}
 			return result
 		}
 
-		result := c.topUpWikiquoteSiteIfEmpty(ctx, site)
+		result := c.topUpWikiquoteCategories(ctx, site)
 		if result.added {
 			emptyStreak = 0
-			fruitlessRandom = 0
 			return result
 		}
 		if result.calledNetwork && !result.networkFailed {
 			emptyStreak++
 		}
-		if emptyStreak >= wikiquoteEmptyStreakBeforeRandom {
+		if emptyStreak >= wikiquoteEmptyStreakBeforeAllPages {
 			emptyStreak = 0
-			randomDue = true
-			logWarn("%s: %d consecutive discovery attempts found nothing new — falling back to random pages", site.source, wikiquoteEmptyStreakBeforeRandom)
+			inAllPages = true
+			logWarn("%s: %d category-walk calls in a row found nothing new — walking the full article list", site.source, wikiquoteEmptyStreakBeforeAllPages)
 		}
 		return result
 	}
@@ -1366,65 +1260,51 @@ func (c *Crawler) Run(ctx context.Context) error {
 	}
 	logInfo("Seed frontier cache warmed up")
 
-	// Each source gets its own goroutine, each with its own cooldown, so a stall or slow fetch
-	// on one never delays a fetch that's already ready on another (see runWorker). The three
-	// goroutines only ever share c.store (pgxpool.Pool and redis.Client are both safe for
-	// concurrent use by design) — nothing else needs synchronizing between them.
+	// Each source gets two goroutines: a worker that only fetches (runWorker), on its own
+	// cooldown, so a stall on one source never delays another; and a feeder that keeps the
+	// worker's queue filled ahead of it (runFeeder, see feeder.go). They only ever share c.store
+	// (pgxpool.Pool and redis.Client are both safe for concurrent use by design) and the source's
+	// sourceThrottle.
 	var wg sync.WaitGroup
+	go2 := func(f func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f()
+		}()
+	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		gd := &goodreadsDiscovery{c: c}
-		c.runWorker(ctx, scoring.SourceGoodreads, minSourceDelayFor(scoring.SourceGoodreads), gd.topUp,
+	gdThrottle := &sourceThrottle{}
+	gd := &goodreadsDiscovery{c: c}
+	go2(func() {
+		c.runWorker(ctx, scoring.SourceGoodreads, minSourceDelayFor(scoring.SourceGoodreads), gdThrottle,
 			func(gotQuotes bool, newQuotes int) { gd.onResult(ctx, gotQuotes, newQuotes) },
 		)
-	}()
+	})
+	go2(func() {
+		c.runFeeder(ctx, scoring.SourceGoodreads, 0, gdThrottle, c.goodreadsNeedsMore, gd.topUp)
+	})
 
-	// Both Wikiquote editions start at wikiquoteExperimentalDelay rather than their
-	// proven-safe minSourceDelayFor value — a deliberate, bounded pacing experiment (requested
-	// explicitly, with the tradeoff understood), automatically abandoned in favor of the safe
-	// pace the instant either one hits a real 429 (see runWorker/abandonExperimentalPace).
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		var deadStreak int
-		c.runWorker(ctx, scoring.SourceWikiquoteEN, wikiquoteExperimentalDelay,
-			c.wikiquoteTopUpFunc(wikiquoteEN),
-			func(gotQuotes bool, _ int) {
-				deadStreak = c.recordWikiquoteYield(ctx, wikiquoteEN, deadStreak, gotQuotes)
-			},
-		)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		var deadStreak int
-		c.runWorker(ctx, scoring.SourceWikiquoteDE, wikiquoteExperimentalDelay,
-			c.wikiquoteTopUpFunc(wikiquoteDE),
-			func(gotQuotes bool, _ int) {
-				deadStreak = c.recordWikiquoteYield(ctx, wikiquoteDE, deadStreak, gotQuotes)
-			},
-		)
-	}()
-
-	// The twelve newer editions start at the same aggressive wikiquoteExperimentalDelay as
-	// EN/DE above, not their proven-safe minSourceDelayFor — see that constant's doc comment.
+	// Every Wikiquote edition starts at wikiquoteExperimentalDelay rather than its proven-safe
+	// minSourceDelayFor value — a deliberate, bounded pacing experiment (requested explicitly,
+	// with the tradeoff understood), automatically abandoned in favor of the safe pace the
+	// instant that edition hits a real 429 (see runWorker/abandonExperimentalPace).
 	for _, site := range []wikiquoteSite{
+		wikiquoteEN, wikiquoteDE,
 		wikiquoteFR, wikiquoteES, wikiquoteIT, wikiquotePT, wikiquotePL,
 		wikiquoteSV, wikiquoteRO, wikiquoteCS, wikiquoteHU, wikiquoteDA, wikiquoteNO, wikiquoteFI,
 	} {
 		site := site
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		throttle := &sourceThrottle{}
+		go2(func() {
 			var deadStreak int
-			c.runWorker(ctx, site.source, wikiquoteExperimentalDelay,
-				c.wikiquoteTopUpFunc(site),
+			c.runWorker(ctx, site.source, wikiquoteExperimentalDelay, throttle,
 				func(gotQuotes bool, _ int) { deadStreak = c.recordWikiquoteYield(ctx, site, deadStreak, gotQuotes) },
 			)
-		}()
+		})
+		go2(func() {
+			c.runFeeder(ctx, site.source, wikiquoteFeederDelay, throttle, c.wikiquoteNeedsMore(site.source), c.wikiquoteTopUpFunc(site))
+		})
 	}
 
 	wg.Wait() // returns once ctx is cancelled and every worker has noticed and exited
@@ -1453,12 +1333,12 @@ func (c *Crawler) SeedFrontier(ctx context.Context) error {
 	}
 
 	// WikiquoteParser has no NextURLs discovery of its own — real discovery comes from
-	// topUpWikiquoteSiteIfEmpty (MediaWiki categorymembers, see wikiquote_discovery.go) once
+	// topUpWikiquoteCategories (MediaWiki categorymembers, see wikiquote_discovery.go) once
 	// this stopgap list runs out. Each URL here is one author page yielding many quotes from a
 	// single fetch, so this list lasts a while even before that kicks in. German has no
 	// equivalent stopgap list — category-based discovery already works well enough that a
 	// hand-picked German author list would just be redundant upfront research; it bootstraps
-	// straight from topUpWikiquoteSiteIfEmpty the first time the crawler goes idle.
+	// straight from topUpWikiquoteCategories the first time the crawler goes idle.
 	wikiquotePriority := scoring.CalculatePriority(scoring.SourceWikiquoteEN, 0, 0)
 	wikiquoteAuthors := []string{
 		"Mark_Twain", "Oscar_Wilde", "Maya_Angelou", "Winston_Churchill", "Mahatma_Gandhi",

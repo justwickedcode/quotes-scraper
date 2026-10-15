@@ -298,54 +298,47 @@ func fetchWikiquoteCategoryMembers(ctx context.Context, site wikiquoteSite, cate
 	return pages, subcats, parsed.Continue.CMContinue, nil
 }
 
-// wikiquoteRandomBatchSize: how many titles to request per random-page fallback call. Modest on
-// purpose — this is a dead-end escape hatch, not the primary discovery mechanism, so it doesn't
-// need anywhere near the 500-per-call category batch size.
-const wikiquoteRandomBatchSize = 50
-
-type wikiquoteRandomResponse struct {
+type wikiquoteAllPagesResponse struct {
+	Continue struct {
+		APContinue string `json:"apcontinue"`
+	} `json:"continue"`
 	Query struct {
-		Random []struct {
+		AllPages []struct {
 			Title string `json:"title"`
-		} `json:"random"`
+		} `json:"allpages"`
 	} `json:"query"`
 }
 
-// fetchWikiquoteRandomPages calls a Wikiquote edition's MediaWiki API
-// (action=query&list=random&rnnamespace=0) for a batch of random article titles — the fallback
-// for when the curated category walk (including its recursive subcategory descent) genuinely
-// finds nothing new for several attempts in a row, confirmed live to actually happen (German
-// Wikiquote's queue went empty mid-way through a large "Wissenschaftler" subcategory branch
-// while most of that branch's members were already known). rnnamespace=0 restricts results to
-// the main article namespace, excluding Category:/Talk:/User:/etc. pages, but not much more —
-// confirmed live this still returns plenty of non-biographical pages (topic pages, redirects,
-// even the occasional user sandbox subpage) alongside real person pages, since it draws from
-// the *entire* wiki rather than curated occupation categories. That's an accepted tradeoff for
-// a dead-end fallback specifically: the existing per-quote filters (IsLatinScript, IsTooShort,
-// LooksLikeDictionaryEntry, MatchesClaimedLanguage) and the parser itself (a non-person page
-// simply has no "Quotes" heading, yielding 0 quotes) already handle a low-yield page harmlessly
-// — better than a worker sitting idle with nothing to try at all.
-func fetchWikiquoteRandomPages(ctx context.Context, site wikiquoteSite) ([]string, error) {
+// fetchWikiquoteAllPages lists the next wikiquoteCategoryBatchSize article titles of an edition
+// in title order (action=query&list=allpages, main namespace, redirects excluded), starting at
+// apContinue ("" for the beginning). The returned token is "" once the last article is reached.
+// This is the exhaustive fallback behind the curated category walk: it sees every article,
+// including ones no curated category reaches. It also sees non-person pages (films, topics);
+// those parse to 0 quotes and cost one fetch each, which beats a worker sitting idle.
+func fetchWikiquoteAllPages(ctx context.Context, site wikiquoteSite, apContinue string) (titles []string, next string, err error) {
 	apiURL := fmt.Sprintf(
-		"%s?action=query&list=random&rnnamespace=0&rnlimit=%d&format=json",
-		site.apiBase, wikiquoteRandomBatchSize,
+		"%s?action=query&list=allpages&apnamespace=0&apfilterredir=nonredirects&aplimit=%d&format=json",
+		site.apiBase, wikiquoteCategoryBatchSize,
 	)
+	if apContinue != "" {
+		apiURL += "&apcontinue=" + url.QueryEscape(apContinue)
+	}
 
 	body, err := fetcher.Fetch(ctx, apiURL)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	var parsed wikiquoteRandomResponse
+	var parsed wikiquoteAllPagesResponse
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	titles := make([]string, 0, len(parsed.Query.Random))
-	for _, m := range parsed.Query.Random {
-		titles = append(titles, m.Title)
+	titles = make([]string, 0, len(parsed.Query.AllPages))
+	for _, p := range parsed.Query.AllPages {
+		titles = append(titles, p.Title)
 	}
-	return titles, nil
+	return titles, parsed.Continue.APContinue, nil
 }
 
 // wikiquoteTitleToURL converts a MediaWiki page title, as returned by the API (spaces, not
@@ -377,7 +370,7 @@ func wikiquoteTitleToURL(site wikiquoteSite, title string) string {
 // branch has no relevance once that branch is done.
 //
 // Every topUp call makes exactly one HTTP request and is exactly one topUpResult — this matters
-// for correctness, not just tidiness: runWorker only applies the per-source cooldown once per
+// for correctness, not just tidiness: runFeeder only applies its delay once per
 // topUp call, so a call that quietly made two HTTP requests back-to-back internally would
 // reintroduce the same unthrottled-discovery-burst bug that caused a live 429 earlier.
 type wikiquoteDiscoveryCursor struct {

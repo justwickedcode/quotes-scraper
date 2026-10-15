@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/url"
 	"strconv"
+	"strings"
+	"sync"
 
 	"quotes-crawler/internal/models"
 	"quotes-crawler/internal/scoring"
@@ -57,11 +59,30 @@ var goodreadsSearchTerms = []string{
 	"becoming", "self", "identity", "mirror", "shadow", "mask",
 }
 
-// goodreadsDiscovery owns Goodreads' discovery state for one worker: the existing tag-cycling and
-// random-page fallbacks (for an empty queue) plus the yield-triggered keyword search (for a queue
-// full of duplicates). Only ever touched from the Goodreads worker goroutine, so no locking.
+// goodreadsAuthorSearchCursorKey holds the last quotes.id scanned for author names to search.
+const goodreadsAuthorSearchCursorKey = "goodreads-author-search"
+
+// goodreadsAuthorScanBatch is how many quotes one author-harvest batch scans, and
+// goodreadsAuthorScanMaxBatches how many batches one call may scan looking for a new name.
+const (
+	goodreadsAuthorScanBatch      = 2000
+	goodreadsAuthorScanMaxBatches = 10
+)
+
+// goodreadsSkipAuthors are attributions that aren't a person to search for. Compared lowercased.
+var goodreadsSkipAuthors = map[string]bool{
+	"unknown": true, "anonymous": true, "anon": true, "anon.": true, "anonym": true, "anonyme": true,
+	"anónimo": true, "anonimo": true, "anonimowy": true, "anônimo": true, "proverb": true,
+	"proverbs": true, "sprichwort": true, "proverbe": true, "proverbio": true, "provérbio": true,
+	"przysłowie": true, "ordspråk": true, "unbekannt": true, "inconnu": true, "desconocido": true,
+	"sconosciuto": true, "desconhecido": true, "nieznany": true, "okänd": true,
+}
+
+// goodreadsDiscovery owns Goodreads' discovery state. The feeder (topUp) and the worker
+// (onResult) both reach seedGoodreadsSearch, from different goroutines, so mu guards it all.
 type goodreadsDiscovery struct {
 	c           *Crawler
+	mu          sync.Mutex
 	emptyStreak int // consecutive tag-cycling attempts that added nothing — see topUp
 	dryStreak   int // consecutive pages whose quotes were all duplicates — see onResult
 	searchSpent bool
@@ -69,8 +90,11 @@ type goodreadsDiscovery struct {
 
 // onResult is runWorker's per-fetch callback. A page with no quotes at all (an empty tag, a parse
 // miss) doesn't count either way; only "had quotes, all already saved" moves toward a search seed.
-// Seeding only touches Postgres/Redis, so doing it here costs no request to goodreads.com.
+// The feeder keeps a stock of searches queued anyway; this jumps one in right away when the
+// pages being fetched have gone stale.
 func (d *goodreadsDiscovery) onResult(ctx context.Context, gotQuotes bool, newQuotes int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if newQuotes > 0 {
 		d.dryStreak = 0
 		return
@@ -83,31 +107,27 @@ func (d *goodreadsDiscovery) onResult(ctx context.Context, gotQuotes bool, newQu
 		return
 	}
 	d.dryStreak = 0
-	d.c.seedGoodreadsSearch(ctx, d)
+	if !d.c.seedGoodreadsSearch(ctx, d).added {
+		d.c.seedGoodreadsAuthorSearches(ctx)
+	}
 }
 
-// topUp is the empty-queue path: the next keyword search while any are left (the deepest chain
-// available), then the curated tag list, then a random popular-quotes page once tags stop finding
-// anything.
-//
-// Unlike Wikiquote's topUpResult.calledNetwork, topUpGoodreadsIfEmpty never sets calledNetwork (it
-// only touches Postgres/Redis), so this checks the pending count directly first: a nonzero count
-// means there's nothing to top up right now and must not count toward the streak.
+// topUp is the feeder's discovery step, called whenever goodreadsNeedsMore says the queue is
+// short. In order: the next keyword search, then searches for authors already collected from
+// other sources, then the curated tag list, then a random popular-quotes page once tags stop
+// finding anything. Everything here is Postgres/Redis only; no request goes to goodreads.com.
 func (d *goodreadsDiscovery) topUp(ctx context.Context) topUpResult {
-	pending, err := d.c.store.CountPendingBySource(ctx, scoring.SourceGoodreads)
-	if err != nil {
-		log.Printf("Could not check Goodreads pending count: %s\n", err)
-		return topUpResult{}
-	}
-	if pending > 0 {
-		return topUpResult{}
-	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	if r := d.c.seedGoodreadsSearch(ctx, d); r.added {
 		return r
 	}
+	if r := d.c.seedGoodreadsAuthorSearches(ctx); r.added {
+		return r
+	}
 
-	result := d.c.topUpGoodreadsIfEmpty(ctx)
+	result := d.c.topUpGoodreadsTag(ctx)
 	if result.added {
 		d.emptyStreak = 0
 		return result
@@ -121,9 +141,74 @@ func (d *goodreadsDiscovery) topUp(ctx context.Context) topUpResult {
 	return result
 }
 
+// seedGoodreadsAuthorSearches queues a Goodreads search for each new author name found in the
+// next goodreadsAuthorScanBatch quotes from other sources (Wikiquote, all editions). A search
+// for a name lists that author's quotes and links their Goodreads author page, whose pagination
+// then runs deep: an entry point into authors the Goodreads link graph may never reach on its
+// own. The scan resumes from a cursor and keeps up with newly saved quotes, so it doesn't run
+// out the way a fixed word list does. Goodreads' own quotes are skipped: their authors are
+// already linked from the pages they came from. Returns added=false only when the scan has
+// caught up with the table (or every name in a batch was already queued; the next call moves on).
+func (c *Crawler) seedGoodreadsAuthorSearches(ctx context.Context) topUpResult {
+	var after int64
+	if raw, err := c.store.GetDiscoveryCursor(ctx, goodreadsAuthorSearchCursorKey); err == nil && raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			after = n
+		}
+	}
+
+	// A batch whose names are all already queued moves the cursor on without adding anything, so
+	// keep scanning (bounded, to keep one call short) until a batch adds something.
+	for batch := 0; batch < goodreadsAuthorScanMaxBatches; batch++ {
+		authors, lastID, err := c.store.QuoteAuthorsAfter(ctx, after, goodreadsAuthorScanBatch, scoring.SourceGoodreads)
+		if err != nil {
+			log.Printf("Could not scan quote authors for Goodreads searches: %s\n", err)
+			return topUpResult{}
+		}
+		if lastID == after {
+			return topUpResult{} // caught up with the quotes table
+		}
+		after = lastID
+		if err := c.store.SetDiscoveryCursor(ctx, goodreadsAuthorSearchCursorKey, strconv.FormatInt(lastID, 10)); err != nil {
+			log.Printf("Could not save Goodreads author-search cursor: %s\n", err)
+		}
+
+		urls := make([]string, 0, len(authors))
+		for _, a := range authors {
+			if n := len([]rune(a)); n < 3 || n > 80 || goodreadsSkipAuthors[strings.ToLower(a)] {
+				continue
+			}
+			urls = append(urls, goodreadsSearchURL(a))
+		}
+		if len(urls) == 0 {
+			continue
+		}
+		priority := scoring.GoodreadsPriority(urls[0], 0)
+		inserted, err := c.store.SaveURLsBatch(ctx, urls, scoring.SourceGoodreads, priority, 0)
+		if err != nil {
+			log.Printf("Could not save Goodreads author searches: %s\n", err)
+			return topUpResult{}
+		}
+		if len(inserted) == 0 {
+			continue
+		}
+		if err := c.store.PushURLsBatch(ctx, scoring.SourceGoodreads, inserted, priority); err != nil {
+			log.Printf("Could not push Goodreads author searches to frontier: %s\n", err)
+			return topUpResult{}
+		}
+		log.Printf("goodreads: queued %d author-name searches from quotes up to id %d (e.g. %s)", len(inserted), lastID, inserted[0])
+		return topUpResult{added: true}
+	}
+	return topUpResult{}
+}
+
+func goodreadsSearchURL(q string) string {
+	return "https://www.goodreads.com/quotes/search?q=" + url.QueryEscape(q)
+}
+
 // seedGoodreadsSearch queues the first page of the next not-yet-seeded search term. Terms already
 // in the frontier (seeded on an earlier run) are skipped without any request, so one call walks
-// forward until it inserts one or has tried the whole list.
+// forward until it inserts one or has tried the whole list. Caller holds d.mu.
 func (c *Crawler) seedGoodreadsSearch(ctx context.Context, d *goodreadsDiscovery) topUpResult {
 	if d.searchSpent {
 		return topUpResult{}
@@ -142,7 +227,7 @@ func (c *Crawler) seedGoodreadsSearch(ctx context.Context, d *goodreadsDiscovery
 			log.Printf("Could not save Goodreads search cursor: %s\n", err)
 		}
 
-		searchURL := "https://www.goodreads.com/quotes/search?q=" + url.QueryEscape(term)
+		searchURL := goodreadsSearchURL(term)
 		priority := scoring.GoodreadsPriority(searchURL, 0)
 		inserted, err := c.store.SaveURL(ctx, models.URLFrontier{URL: searchURL, Source: scoring.SourceGoodreads, Priority: priority})
 		if err != nil {
@@ -156,11 +241,11 @@ func (c *Crawler) seedGoodreadsSearch(ctx context.Context, d *goodreadsDiscovery
 			log.Printf("Could not push Goodreads search seed to frontier: %s\n", err)
 			return topUpResult{}
 		}
-		log.Printf("goodreads: recent pages were all duplicates — seeded keyword search %q (%s)", term, searchURL)
+		log.Printf("goodreads: seeded keyword search %q (%s)", term, searchURL)
 		return topUpResult{added: true}
 	}
 
 	d.searchSpent = true
-	log.Printf("goodreads: every one of the %d keyword search terms has already been seeded — add more to goodreadsSearchTerms to keep this fallback useful", len(goodreadsSearchTerms))
+	log.Printf("goodreads: all %d keyword search terms are seeded — continuing with author-name searches", len(goodreadsSearchTerms))
 	return topUpResult{}
 }
