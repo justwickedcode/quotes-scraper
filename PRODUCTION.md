@@ -1,9 +1,9 @@
 # Production deployment
 
-`docker-compose.prod.yml` deploys the crawler on its own. It deliberately has **no**
+`docker-compose.yml` deploys the crawler on its own. It deliberately has **no**
 `postgres`/`redis` service blocks — it deploys against Postgres and Redis that already exist
 elsewhere (e.g. Dokploy Database resources you manage and back up separately), via
-`DATABASE_URL`/`REDIS_ADDR`. `docker-compose.yml` is the local-dev Postgres/Redis only.
+`DATABASE_URL`/`REDIS_ADDR`. `docker-compose.dev.yml` is the local-dev Postgres/Redis only.
 
 This project was split out of the Vroomy monorepo (`backend/scraper`), git history included.
 
@@ -46,8 +46,8 @@ REDIS_ADDR    — the crawler's own Redis (redis://... form is fine directly —
 ## 2. Bring it up (plain `docker compose`, no Dokploy)
 
 ```bash
-docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
-docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f
+docker compose --env-file .env.prod up -d --build
+docker compose --env-file .env.prod logs -f
 ```
 
 `restart: unless-stopped`, no ports, no healthcheck — it's a background worker with no HTTP
@@ -77,7 +77,7 @@ Local disk only — point `BACKUP_DIR` somewhere synced offsite for real disaste
 
 ## 4. Deploying via Dokploy
 
-- Deploy as a **Compose** project with compose path `docker-compose.prod.yml`. No Domain — there
+- Deploy as a **Compose** project with compose path `docker-compose.yml` (Dokploy's default). No Domain — there
   is nothing to route to.
 - Set `DATABASE_URL`/`REDIS_ADDR` under **Environment Settings** with **"Create Environment
   File"** enabled — with it off, every `${VAR}` silently resolves to an empty string. Saving env

@@ -16,7 +16,7 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 : "${POSTGRES_USER:?POSTGRES_USER must be set}"
 : "${POSTGRES_DB:?POSTGRES_DB must be set}"
-# No default here deliberately: the dev compose (docker-compose.yml) names its
+# No default here deliberately: the dev compose (docker-compose.dev.yml) names its
 # Postgres container "quotes-crawler" — production Postgres isn't run by this repo's compose at
 # all (see PRODUCTION.md), so there's no single right default to guess; pass whatever your real
 # container is actually named.

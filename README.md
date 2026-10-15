@@ -25,7 +25,7 @@ This project runs on Goodreads plus fourteen Wikiquote language editions — rat
 
 ## Deployment
 
-`Dockerfile` builds a static binary in a multi-stage build (no CGO, migrations embedded via `//go:embed` — no separate files to copy into the runtime image). For a real production deployment (`docker-compose.prod.yml`, secrets, backups, Dokploy) see `PRODUCTION.md` — it also documents the contract with consumers (the `quotes` columns Vroomy reads), and two real bugs a from-scratch containerized run caught live, worth reading before assuming this "just works" in a container:
+`Dockerfile` builds a static binary in a multi-stage build (no CGO, migrations embedded via `//go:embed` — no separate files to copy into the runtime image). For a real production deployment (`docker-compose.yml`, secrets, backups, Dokploy) see `PRODUCTION.md` — it also documents the contract with consumers (the `quotes` columns Vroomy reads), and two real bugs a from-scratch containerized run caught live, worth reading before assuming this "just works" in a container:
 
 - **`ConnectRedis` used to silently connect to the wrong host** for a plain `host:port` address like a Docker service name (`redis:6379`) — invisible in local dev only because `REDIS_ADDR` there has always literally _been_ `localhost:6379`. Fixed in `internal/db/redis.go`.
 - **Real memory need is ~1.25GB**, not a naive guess — the language detector (see "Real language verification" below) loads statistical models into memory, and the actual stable working set was measured live (container memory limit removed, usage observed over a sustained run), not assumed from first principles.
@@ -116,12 +116,12 @@ go test -cover ./...        # with coverage
 
 ### Live integration tests
 
-`internal/crawler/integration_test.go` (build tag `integration`) runs against the project's own `docker-compose.yml` Postgres + Redis instead of testcontainers, and includes three tests that do a real HTTP fetch against the live internet (`goodreads.com`, `quotes.toscrape.com`, `en.wikiquote.org`) — no fixtures, no mocking — parsing real pages, saving real quotes, and (for Goodreads and toscrape) pushing a real discovered URL into the Redis `frontier` ZSET.
+`internal/crawler/integration_test.go` (build tag `integration`) runs against the project's own `docker-compose.dev.yml` Postgres + Redis instead of testcontainers, and includes three tests that do a real HTTP fetch against the live internet (`goodreads.com`, `quotes.toscrape.com`, `en.wikiquote.org`) — no fixtures, no mocking — parsing real pages, saving real quotes, and (for Goodreads and toscrape) pushing a real discovered URL into the Redis `frontier` ZSET.
 
 ```bash
-docker compose up -d
+docker compose -f docker-compose.dev.yml up -d
 go test -tags=integration -count=1 ./internal/crawler/... -v
-docker compose down
+docker compose -f docker-compose.dev.yml down
 ```
 
 State persists in the compose volumes across runs by design (dev env) — the tests are idempotent (dedup on quotes, `ON CONFLICT DO NOTHING` on URLs).

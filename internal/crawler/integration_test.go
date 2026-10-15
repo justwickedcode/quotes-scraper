@@ -1,7 +1,7 @@
 //go:build integration
 
 // Integration tests against the docker-compose Postgres + Redis (not testcontainers).
-// Run with: docker compose up -d && go test -tags=integration ./internal/crawler/...
+// Run with: docker compose -f docker-compose.dev.yml up -d && go test -tags=integration ./internal/crawler/...
 // State persists in the compose volumes across runs by design (dev env).
 package crawler_test
 
@@ -37,7 +37,7 @@ func setupStore(t *testing.T) (*db.Store, *redis.Client) {
 	}
 	pool, err := db.ConnectPostgres(dbURL)
 	if err != nil {
-		t.Fatalf("could not connect to postgres (is `docker compose up` running?): %v", err)
+		t.Fatalf("could not connect to postgres (is `docker compose -f docker-compose.dev.yml up` running?): %v", err)
 	}
 	t.Cleanup(pool.Close)
 
@@ -60,7 +60,7 @@ func setupStore(t *testing.T) (*db.Store, *redis.Client) {
 
 	redisClient, err := db.ConnectRedis(redisAddr, redisPassword, redisDB)
 	if err != nil {
-		t.Fatalf("could not connect to redis (is `docker compose up` running?): %v", err)
+		t.Fatalf("could not connect to redis (is `docker compose -f docker-compose.dev.yml up` running?): %v", err)
 	}
 	t.Cleanup(func() { _ = redisClient.Close() })
 

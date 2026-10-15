@@ -1,45 +1,38 @@
+# Production deployment of the crawler on its own, deployed against Postgres and Redis that
+# already exist as their own Dokploy Database resources (managed and backed up outside this
+# file) — no postgres/redis service blocks here. docker-compose.dev.yml next to this file is the
+# local-dev Postgres/Redis only. See PRODUCTION.md.
+#
+# Required env vars:
+#   DATABASE_URL — the shared quotes Postgres database's connection string
+#   REDIS_ADDR   — the crawler's own Redis connection string (redis://... is fine directly)
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
 services:
-  database:
-    image: postgres:16
-    container_name: quotes-crawler
+  crawler:
+    build: .
     restart: unless-stopped
-
-    ports:
-      - '55432:5432'
-
+    logging: *default-logging
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_ADDR: ${REDIS_ADDR}
+      REDIS_DB: 0
+      GOMEMLIMIT: 1536MiB
+      LOG_LEVEL: error
+    deploy:
+      resources:
+        limits:
+          memory: 2G
 
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-    healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER}']
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  redis:
-    image: redis:7-alpine
-    container_name: quotes-crawler-redis
-    restart: unless-stopped
-
-    command: redis-server --requirepass ${REDIS_PASSWORD}
-
-    ports:
-      - '6379:6379'
-
-    volumes:
-      - redis_data:/data
-
-    healthcheck:
-      test: ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD}', 'ping']
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-volumes:
-  postgres_data:
-  redis_data:
+# Dokploy Database resources live on the shared "dokploy-network" overlay network — a Compose
+# project's auto-created default bridge network has no route to them, and DATABASE_URL/REDIS_ADDR
+# hostnames fail DNS resolution outright. See PRODUCTION.md's findings.
+networks:
+  default:
+    name: dokploy-network
+    external: true
