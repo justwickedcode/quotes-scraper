@@ -2,8 +2,7 @@
 
 A polite, long-running web crawler in Go that builds a multilingual corpus of quotes from
 Goodreads and 14 Wikiquote language editions. It powers the passages in
-[Vroomy](https://vroomy.justwickedcode.dev), a multiplayer typing game, and has collected
-**2.7M+ deduplicated quotes** so far.
+[Vroomy](https://vroomy.justwickedcode.dev), a multiplayer typing game.
 
 **Go · PostgreSQL · Redis · goquery · lingua-go · goose · Docker**
 
