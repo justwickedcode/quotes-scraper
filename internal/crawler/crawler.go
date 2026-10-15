@@ -101,6 +101,16 @@ const (
 	// out a long streak to be confident that's really what's happening.
 	goodreadsEmptyStreakBeforeRandom = 3
 
+	// wikiquoteSaturationRandomMisses / wikiquoteSaturatedRest: how many random-page batches in a
+	// row must come back entirely already-known before an edition is treated as fully crawled,
+	// and how long its discovery then stays dormant — see wikiquoteTopUpFunc. Three batches is
+	// 150 random titles with zero unknowns; if even 2% of an edition's articles were still
+	// unknown, that would happen by chance only ~5% of the time, so it's a cheap but meaningful
+	// signal. Six hours is long enough to cut discovery traffic to near nothing for an exhausted
+	// edition, short enough that newly created pages still get picked up the same day.
+	wikiquoteSaturationRandomMisses = 3
+	wikiquoteSaturatedRest          = 6 * time.Hour
+
 	// goodreadsRandomPageMax bounds which page of Goodreads' own /quotes "popular quotes" listing
 	// topUpGoodreadsRandomPages picks from — confirmed live the listing paginates to page 100
 	// (its own next_page chain stops there), and that the exact same div.quote/quoteText/
@@ -745,7 +755,7 @@ func (c *Crawler) topUpGoodreadsIfEmpty(ctx context.Context) topUpResult {
 	}
 
 	tagURL := "https://www.goodreads.com/quotes/tag/" + tag
-	priority := scoring.CalculatePriority(scoring.SourceGoodreads, 0, 0)
+	priority := scoring.GoodreadsPriority(tagURL, 0)
 	frontier := models.URLFrontier{URL: tagURL, Source: scoring.SourceGoodreads, Priority: priority}
 	inserted, err := c.store.SaveURL(ctx, frontier)
 	if err != nil {
@@ -782,7 +792,7 @@ func (c *Crawler) topUpGoodreadsRandomPages(ctx context.Context) topUpResult {
 		pageURL = fmt.Sprintf("https://www.goodreads.com/quotes?page=%d", page)
 	}
 
-	priority := scoring.CalculatePriority(scoring.SourceGoodreads, 0, 0)
+	priority := scoring.GoodreadsPriority(pageURL, 0)
 	frontier := models.URLFrontier{URL: pageURL, Source: scoring.SourceGoodreads, Priority: priority}
 	inserted, err := c.store.SaveURL(ctx, frontier)
 	if err != nil {
@@ -799,49 +809,6 @@ func (c *Crawler) topUpGoodreadsRandomPages(ctx context.Context) topUpResult {
 	}
 	logInfo("Discovered URL [goodreads]: %s (random popular-quotes page — tag cycling had run dry)", pageURL)
 	return topUpResult{added: true}
-}
-
-// goodreadsTopUpFunc returns a topUp closure for Goodreads: the normal tag-cycling fallback
-// (topUpGoodreadsIfEmpty), falling back to a random popular-quotes page
-// (topUpGoodreadsRandomPages) once goodreadsEmptyStreakBeforeRandom consecutive calls in a row
-// find nothing new — the same shape as wikiquoteTopUpFunc. emptyStreak is local to this closure,
-// one per Crawler.Run call, matching how Goodreads only ever runs one worker.
-//
-// Unlike Wikiquote's topUpResult.calledNetwork (which distinguishes "didn't even try" from "tried
-// and found nothing" for free, since a real API call either happens or doesn't),
-// topUpGoodreadsIfEmpty never sets calledNetwork — by design, it only ever touches Postgres/Redis
-// (see its own doc comment on why that shouldn't consume Goodreads' fetch cooldown). So this
-// closure checks Goodreads' own pending count directly before deferring to topUpGoodreadsIfEmpty:
-// a nonzero pending count means there's genuinely nothing to top up right now, not evidence the
-// tag list is exhausted, and must not count toward the streak — otherwise, since Goodreads
-// realistically never holds anywhere near minFrontierBuffer (20) pending URLs at once (a single
-// pagination chain plus occasional tag seeds), runWorker would call this on nearly every idle
-// tick regardless of whether Goodreads is anywhere close to actually running dry.
-func (c *Crawler) goodreadsTopUpFunc() func(ctx context.Context) topUpResult {
-	var emptyStreak int
-	return func(ctx context.Context) topUpResult {
-		pending, err := c.store.CountPendingBySource(ctx, scoring.SourceGoodreads)
-		if err != nil {
-			log.Printf("Could not check Goodreads pending count: %s\n", err)
-			return topUpResult{}
-		}
-		if pending > 0 {
-			return topUpResult{}
-		}
-
-		result := c.topUpGoodreadsIfEmpty(ctx)
-		if result.added {
-			emptyStreak = 0
-			return result
-		}
-		emptyStreak++
-		if emptyStreak >= goodreadsEmptyStreakBeforeRandom {
-			emptyStreak = 0
-			logWarn("goodreads: %d consecutive tag-cycling attempts found nothing new — falling back to a random popular-quotes page", goodreadsEmptyStreakBeforeRandom)
-			return c.topUpGoodreadsRandomPages(ctx)
-		}
-		return result
-	}
 }
 
 // hardFailureRetryDelay is how long an outright-failed URL (a plain non-200 status or network
@@ -879,7 +846,7 @@ func (c *Crawler) failOrRetry(ctx context.Context, source string, row models.URL
 		return
 	}
 
-	priority := scoring.CalculatePriority(source, int(row.Depth), int(nextErrorCount))
+	priority := scoring.PriorityFor(source, row.URL, int(row.Depth), int(nextErrorCount))
 
 	if delay <= 0 {
 		if err := c.store.RetryURL(ctx, row.URL, nextErrorCount, priority); err != nil {
@@ -903,7 +870,8 @@ func (c *Crawler) failOrRetry(ctx context.Context, source string, row models.URL
 
 // processURL fetches, parses, and saves everything for one URL — identical work regardless of
 // which source's worker goroutine calls it. Returns gotQuotes (fed into a Wikiquote worker's
-// dead-streak circuit breaker; always false for Goodreads, which ignores it), stalled (true if
+// dead-streak circuit breaker), newQuotes (how many quotes were actually saved, i.e. not
+// duplicates — fed into Goodreads' dry-streak search trigger, see goodreads_discovery.go), stalled (true if
 // the fetch was slow-but-succeeded or hit a 429 — both real evidence of a source-wide problem,
 // telling the caller to back this source's whole cooldown off to stallPenaltyFor(source) instead
 // of just its normal minDelay for the next iteration), and rateLimited (specifically a 429, as
@@ -915,7 +883,7 @@ func (c *Crawler) failOrRetry(ctx context.Context, source string, row models.URL
 // page means the next, different page from the same source is about to fail too, so the worker
 // just schedules that one URL for a delayed retry (hardFailureRetryDelay) and immediately
 // continues with whatever else is ready — see failOrRetry.
-func (c *Crawler) processURL(ctx context.Context, source string, url string) (gotQuotes bool, stalled bool, rateLimited bool) {
+func (c *Crawler) processURL(ctx context.Context, source string, url string) (gotQuotes bool, newQuotes int, stalled bool, rateLimited bool) {
 	// Defense-in-depth against MediaWiki red links (see parser.resolveWikiquoteLink, which
 	// already stops new ones from ever being queued): this still catches any row that was
 	// queued *before* that fix shipped and is only now being popped off the frontier. Without
@@ -929,18 +897,18 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 			log.Printf("[%s] Could not mark red-link URL %s failed: %s\n", source, url, err)
 		}
 		log.Printf("[%s] Skipping known-dead red link (queued before the discovery fix): %s", source, url)
-		return false, false, false
+		return false, 0, false, false
 	}
 
 	row, err := c.store.GetURLByURL(ctx, url)
 	if err != nil {
 		log.Printf("[%s] Could not look up URL %s: %s\n", source, url, err)
-		return false, false, false
+		return false, 0, false, false
 	}
 
 	if err := c.store.MarkURLInProgress(ctx, url); err != nil {
 		log.Printf("[%s] Could not mark the URL: %s\n", source, err)
-		return false, false, false
+		return false, 0, false, false
 	}
 
 	fetchStart := time.Now()
@@ -959,7 +927,7 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 			log.Printf("Fetch failed for %s (source=%s): %s — scheduling a retry in ~%s, continuing with other work meanwhile", url, source, err, hardFailureRetryDelay)
 			c.failOrRetry(ctx, source, row, hardFailureRetryDelay)
 		}
-		return false, stalled, rateLimited
+		return false, 0, stalled, rateLimited
 	}
 
 	var p parser.Parser
@@ -999,7 +967,7 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 		if err := c.store.MarkURLFailed(ctx, url); err != nil {
 			log.Printf("[%s] Could not mark the URL: %s\n", source, err)
 		}
-		return false, stalled, false
+		return false, 0, stalled, false
 	}
 
 	result, err := p.Parse(html)
@@ -1008,7 +976,7 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 		if err := c.store.MarkURLFailed(ctx, url); err != nil {
 			log.Printf("[%s] Could not mark the URL: %s\n", source, err)
 		}
-		return false, stalled, false
+		return false, 0, stalled, false
 	}
 	logInfo("Parsed %s (source=%s): found %d quotes, %d discovered URLs", url, source, len(result.Quotes), len(result.NextURLs))
 
@@ -1043,12 +1011,12 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 		candidates = append(candidates, quote)
 	}
 
+	newlySaved := 0
 	if len(candidates) > 0 {
 		saved, err := c.store.SaveQuotes(ctx, candidates)
 		if err != nil {
 			log.Printf("Could not save quotes: %s\n", err)
 		} else {
-			newlySaved := 0
 			for i, quote := range candidates {
 				if saved[i] {
 					newlySaved++
@@ -1062,20 +1030,40 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 	}
 
 	if len(result.NextURLs) > 0 {
-		// Batched INSERT + batched ZADD, same as the discovery top-up paths — citation-link
-		// extraction can surface dozens of URLs per page, not the 0-1 a per-URL round-trip
-		// loop was originally sized for.
-		priority := scoring.CalculatePriority(source, int(row.Depth)+1, 0)
-		inserted, err := c.store.SaveURLsBatch(ctx, result.NextURLs, source, priority, row.Depth+1)
-		if err != nil {
-			log.Printf("Could not save discovered URLs: %s\n", err)
-		} else if len(inserted) > 0 {
+		// Batched INSERT + batched ZADD per distinct priority, same as the discovery top-up
+		// paths — citation-link extraction can surface dozens of URLs per page, not the 0-1 a
+		// per-URL round-trip loop was originally sized for. Goodreads scores each URL by its
+		// shape (see scoring.GoodreadsPriority), so one page's links span a few priorities.
+		staleChain := false
+		if source == scoring.SourceGoodreads && len(candidates) > 0 && newlySaved == 0 {
+			_, page := scoring.GoodreadsPage(url)
+			staleChain = page > 1
+		}
+		byPriority := make(map[float64][]string)
+		for _, next := range result.NextURLs {
+			priority := scoring.PriorityFor(source, next, int(row.Depth)+1, 0)
+			if staleChain {
+				if _, page := scoring.GoodreadsPage(next); page > 1 {
+					priority += scoring.GoodreadsStaleChainPenalty
+				}
+			}
+			byPriority[priority] = append(byPriority[priority], next)
+		}
+		for priority, urls := range byPriority {
+			inserted, err := c.store.SaveURLsBatch(ctx, urls, source, priority, row.Depth+1)
+			if err != nil {
+				log.Printf("Could not save discovered URLs: %s\n", err)
+				continue
+			}
+			if len(inserted) == 0 {
+				continue
+			}
 			if err := c.store.PushURLsBatch(ctx, source, inserted, priority); err != nil {
 				log.Printf("Could not push discovered URLs to frontier: %s\n", err)
-			} else {
-				for _, u := range inserted {
-					logInfo("Discovered URL [%s]: %s (from %s)", source, u, url)
-				}
+				continue
+			}
+			for _, u := range inserted {
+				logInfo("Discovered URL [%s]: %s (from %s)", source, u, url)
 			}
 		}
 	}
@@ -1084,7 +1072,7 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 		log.Printf("Could not mark the URL as done: %s\n", err)
 	}
 
-	return len(result.Quotes) > 0, stalled, false
+	return len(result.Quotes) > 0, newlySaved, stalled, false
 }
 
 // runWorker drives one source's fetch loop independently, forever, on its own goroutine — the
@@ -1096,7 +1084,7 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 // across sources — each is only ever touched by the one goroutine that owns it, so there's
 // nothing to lock. topUp is called whenever this source's queue is empty (nil for a source
 // with no top-up mechanism); onResult, if non-nil, is handed whether the fetch yielded any
-// quotes, for the Wikiquote dead-streak logic to update its own local streak.
+// quotes and how many of them were newly saved, for the Wikiquote dead-streak logic to update its own local streak.
 //
 // Every wait point uses sleepCtx instead of time.Sleep and checks its result (or ctx.Err()
 // directly), so cancelling ctx (graceful shutdown — see Run) stops this loop within roughly one
@@ -1115,7 +1103,7 @@ func (c *Crawler) processURL(ctx context.Context, source string, url string) (go
 // the deliberately narrower wikiquoteExperimentalDelay for a Wikiquote worker) but is a plain
 // local variable, not a fixed parameter — abandonExperimentalPace can permanently widen it mid-run
 // the instant a real 429 shows up, without needing any state shared outside this one goroutine.
-func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Duration, topUp func(ctx context.Context) topUpResult, onResult func(gotQuotes bool)) {
+func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Duration, topUp func(ctx context.Context) topUpResult, onResult func(gotQuotes bool, newQuotes int)) {
 	// A random startup stagger for every Wikiquote worker (not Goodreads — a single stream has
 	// no herd to desynchronize) — found live: all fourteen goroutines start in the same instant,
 	// so their very first discovery call collides immediately, before any retry jitter ever gets
@@ -1228,7 +1216,7 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 		}
 
 		lastFetch = time.Now()
-		gotQuotes, stalled, rateLimited := c.processURL(ctx, source, url)
+		gotQuotes, newQuotes, stalled, rateLimited := c.processURL(ctx, source, url)
 		if stalled {
 			lastFetch = lastFetch.Add(stallPenaltyFor(source) - minDelay)
 			if rateLimited {
@@ -1236,7 +1224,7 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 			}
 		}
 		if onResult != nil {
-			onResult(gotQuotes)
+			onResult(gotQuotes, newQuotes)
 		}
 	}
 }
@@ -1261,16 +1249,56 @@ func (c *Crawler) abandonExperimentalPace(source string, current time.Duration) 
 // wikiquoteTopUpFunc returns a topUp closure for site: the normal curated-category walk
 // (topUpWikiquoteSiteIfEmpty), falling back to a batch of genuinely random pages
 // (topUpWikiquoteRandomPages) once wikiquoteEmptyStreakBeforeRandom consecutive calls in a row
-// find nothing new to queue. emptyStreak is local to this closure (one per site, since each
-// Wikiquote edition's worker gets its own call to this function) — only counts calls that
-// actually completed without a network error; a failed/rate-limited attempt isn't evidence the
-// category tree is exhausted, so it shouldn't push the streak toward triggering the fallback.
+// find nothing new to queue. All state is local to this closure (one per site, since each
+// Wikiquote edition's worker gets its own call to this function). Only calls that actually
+// completed without a network error count toward either streak — a failed/rate-limited attempt
+// isn't evidence the edition is exhausted.
+//
+// The random fallback runs on the *next* call, not in the same call as the discovery request
+// that tripped the streak — found live that doing both in one call fired two MediaWiki API
+// requests ~150ms apart, breaking the one-request-per-topUp invariant runWorker's cooldown
+// relies on (see wikiquoteDiscoveryCursor) and doubling the request rate exactly when an
+// edition had nothing left to find.
+//
+// Saturation: once wikiquoteSaturationRandomMisses random batches in a row come back with every
+// title already known, the edition is treated as fully crawled and topUp goes dormant for
+// wikiquoteSaturatedRest — returning a no-op, so the worker still drains whatever is already
+// pending but makes no discovery requests at all. Found live at ~2.7M quotes: every edition was
+// re-walking already-known categories and random pages back to back, ~2 API calls per cooldown
+// per edition for zero new URLs, enough aggregate volume across fourteen editions to trip 429s on
+// all of them within the same few seconds. On waking, the category walk resumes from its cursor,
+// which is what eventually picks up pages created in the meantime.
 func (c *Crawler) wikiquoteTopUpFunc(site wikiquoteSite) func(ctx context.Context) topUpResult {
-	var emptyStreak int
+	var emptyStreak, fruitlessRandom int
+	var randomDue bool
+	var dormantUntil time.Time
 	return func(ctx context.Context) topUpResult {
+		if time.Now().Before(dormantUntil) {
+			return topUpResult{}
+		}
+
+		if randomDue {
+			randomDue = false
+			result := c.topUpWikiquoteRandomPages(ctx, site)
+			switch {
+			case result.added:
+				fruitlessRandom = 0
+			case result.calledNetwork && !result.networkFailed:
+				fruitlessRandom++
+				if fruitlessRandom >= wikiquoteSaturationRandomMisses {
+					fruitlessRandom = 0
+					dormantUntil = time.Now().Add(wikiquoteSaturatedRest)
+					log.Printf("%s: %d random batches in a row (%d titles) were all already known — edition looks fully crawled, pausing discovery until %s",
+						site.source, wikiquoteSaturationRandomMisses, wikiquoteSaturationRandomMisses*wikiquoteRandomBatchSize, dormantUntil.Format(time.RFC3339))
+				}
+			}
+			return result
+		}
+
 		result := c.topUpWikiquoteSiteIfEmpty(ctx, site)
 		if result.added {
 			emptyStreak = 0
+			fruitlessRandom = 0
 			return result
 		}
 		if result.calledNetwork && !result.networkFailed {
@@ -1278,8 +1306,8 @@ func (c *Crawler) wikiquoteTopUpFunc(site wikiquoteSite) func(ctx context.Contex
 		}
 		if emptyStreak >= wikiquoteEmptyStreakBeforeRandom {
 			emptyStreak = 0
+			randomDue = true
 			logWarn("%s: %d consecutive discovery attempts found nothing new — falling back to random pages", site.source, wikiquoteEmptyStreakBeforeRandom)
-			return c.topUpWikiquoteRandomPages(ctx, site)
 		}
 		return result
 	}
@@ -1314,6 +1342,19 @@ func (c *Crawler) Run(ctx context.Context) error {
 		logWarn("Requeued %d URL(s) stuck in_progress from a previous run", requeued)
 	}
 
+	// Goodreads is scored by URL shape (scoring.GoodreadsPriority); rescoring here applies the
+	// current scheme to the backlog already queued too, not only to URLs discovered from now on.
+	// A no-op write-wise once every pending row already matches.
+	rescored, err := c.store.RescorePending(ctx, scoring.SourceGoodreads, func(u string, errorCount int32) float64 {
+		return scoring.GoodreadsPriority(u, int(errorCount))
+	})
+	if err != nil {
+		return err
+	}
+	if rescored > 0 {
+		log.Printf("Rescored %s pending Goodreads URL(s) by page type", formatCount(int64(rescored)))
+	}
+
 	err = c.store.WarmFrontierCache(ctx)
 	if err != nil {
 		return err
@@ -1334,7 +1375,10 @@ func (c *Crawler) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		c.runWorker(ctx, scoring.SourceGoodreads, minSourceDelayFor(scoring.SourceGoodreads), c.goodreadsTopUpFunc(), nil)
+		gd := &goodreadsDiscovery{c: c}
+		c.runWorker(ctx, scoring.SourceGoodreads, minSourceDelayFor(scoring.SourceGoodreads), gd.topUp,
+			func(gotQuotes bool, newQuotes int) { gd.onResult(ctx, gotQuotes, newQuotes) },
+		)
 	}()
 
 	// Both Wikiquote editions start at wikiquoteExperimentalDelay rather than their
@@ -1347,7 +1391,9 @@ func (c *Crawler) Run(ctx context.Context) error {
 		var deadStreak int
 		c.runWorker(ctx, scoring.SourceWikiquoteEN, wikiquoteExperimentalDelay,
 			c.wikiquoteTopUpFunc(wikiquoteEN),
-			func(gotQuotes bool) { deadStreak = c.recordWikiquoteYield(ctx, wikiquoteEN, deadStreak, gotQuotes) },
+			func(gotQuotes bool, _ int) {
+				deadStreak = c.recordWikiquoteYield(ctx, wikiquoteEN, deadStreak, gotQuotes)
+			},
 		)
 	}()
 
@@ -1357,7 +1403,9 @@ func (c *Crawler) Run(ctx context.Context) error {
 		var deadStreak int
 		c.runWorker(ctx, scoring.SourceWikiquoteDE, wikiquoteExperimentalDelay,
 			c.wikiquoteTopUpFunc(wikiquoteDE),
-			func(gotQuotes bool) { deadStreak = c.recordWikiquoteYield(ctx, wikiquoteDE, deadStreak, gotQuotes) },
+			func(gotQuotes bool, _ int) {
+				deadStreak = c.recordWikiquoteYield(ctx, wikiquoteDE, deadStreak, gotQuotes)
+			},
 		)
 	}()
 
@@ -1374,7 +1422,7 @@ func (c *Crawler) Run(ctx context.Context) error {
 			var deadStreak int
 			c.runWorker(ctx, site.source, wikiquoteExperimentalDelay,
 				c.wikiquoteTopUpFunc(site),
-				func(gotQuotes bool) { deadStreak = c.recordWikiquoteYield(ctx, site, deadStreak, gotQuotes) },
+				func(gotQuotes bool, _ int) { deadStreak = c.recordWikiquoteYield(ctx, site, deadStreak, gotQuotes) },
 			)
 		}()
 	}
@@ -1399,9 +1447,9 @@ func (c *Crawler) SeedFrontier(ctx context.Context) error {
 		return nil
 	}
 
-	goodreadsPriority := scoring.CalculatePriority(scoring.SourceGoodreads, 0, 0)
+	goodreadsSeed := "https://www.goodreads.com/quotes/tag/inspirational"
 	seeds := []models.URLFrontier{
-		{URL: "https://www.goodreads.com/quotes/tag/inspirational", Source: scoring.SourceGoodreads, Priority: goodreadsPriority},
+		{URL: goodreadsSeed, Source: scoring.SourceGoodreads, Priority: scoring.GoodreadsPriority(goodreadsSeed, 0)},
 	}
 
 	// WikiquoteParser has no NextURLs discovery of its own — real discovery comes from

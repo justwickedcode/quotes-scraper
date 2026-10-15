@@ -760,3 +760,52 @@ func (s *Store) countQuotesGroupedBy(ctx context.Context, column string) (map[st
 	}
 	return counts, rows.Err()
 }
+
+// rescoreChunkSize bounds how many rows one RescorePending UPDATE carries.
+const rescoreChunkSize = 5000
+
+// RescorePending recomputes the stored priority of every pending row for source using score,
+// writing back only rows whose priority actually changes. Run before WarmFrontierCache so a
+// change to how a source is scored also applies to the backlog already queued, not just to
+// URLs discovered from now on. Returns how many rows changed.
+func (s *Store) RescorePending(ctx context.Context, source string, score func(url string, errorCount int32) float64) (int, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT url, priority, error_count FROM url_frontier WHERE source = $1 AND status = 'pending'`,
+		source,
+	)
+	if err != nil {
+		return 0, err
+	}
+	var urls []string
+	var priorities []float64
+	for rows.Next() {
+		var u string
+		var old float64
+		var errorCount int32
+		if err := rows.Scan(&u, &old, &errorCount); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if p := score(u, errorCount); p != old {
+			urls = append(urls, u)
+			priorities = append(priorities, p)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for start := 0; start < len(urls); start += rescoreChunkSize {
+		end := min(start+rescoreChunkSize, len(urls))
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE url_frontier f SET priority = v.priority
+			 FROM unnest($1::text[], $2::float8[]) AS v(url, priority)
+			 WHERE f.url = v.url`,
+			urls[start:end], priorities[start:end],
+		); err != nil {
+			return start, err
+		}
+	}
+	return len(urls), nil
+}
