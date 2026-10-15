@@ -2,6 +2,7 @@ package db
 
 import (
 	"embed"
+	"errors"
 	"log"
 	"path"
 	"time"
@@ -30,8 +31,9 @@ func Migrate(pool *pgxpool.Pool) error {
 	if err != nil {
 		return err
 	}
+	// goose reports "nothing newer than current" as ErrNoMigrationFiles rather than an empty list.
 	pending, err := goose.CollectMigrations("migrations", current, goose.MaxVersion)
-	if err != nil {
+	if err != nil && !errors.Is(err, goose.ErrNoMigrationFiles) {
 		return err
 	}
 	if len(pending) == 0 {
