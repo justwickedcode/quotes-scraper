@@ -42,7 +42,8 @@ DATABASE_URL  — the shared quotes Postgres connection string
 
 That's the only one. `.env.prod.example` documents it — copy it to `.env.prod` (gitignored) if
 deploying with plain `docker compose`. `REDIS_ADDR` (pointing at the bundled `crawler-redis`),
-`REDIS_DB`, `GOMEMLIMIT` and `LOG_LEVEL` are already set in the compose file.
+`REDIS_DB` and `GOMEMLIMIT` are already set in the compose file;
+`LOG_LEVEL` defaults to `error` there and can be overridden (see below).
 
 ## 2. Bring it up (plain `docker compose`, no Dokploy)
 
@@ -100,9 +101,10 @@ Local disk only — point `BACKUP_DIR` somewhere synced offsite for real disaste
   active-hours pause was reverted: it cut CPU/network but never freed the ~1.25 GB the language
   models hold. Now that the crawler is its own Compose project, Dokploy can stop/start it without
   touching anything else.
-- **`LOG_LEVEL`**: `info` (unset) logs everything; `warn` drops per-page/per-quote narration but
-  keeps skips/retries/backoffs; `error` keeps genuine failures only. The compose file sets
-  `error`.
+- **`LOG_LEVEL`**: `info` logs everything; `warn` drops per-page/per-quote narration but keeps
+  skips/retries/backoffs; `error` keeps genuine failures only. There is no `debug` — it's
+  rejected at startup. The compose file defaults to `error`; for full output set
+  `LOG_LEVEL=info` under **Environment Settings** and redeploy, then remove it and redeploy again.
 - **Log size** is capped at 10 MB × 3 via the compose `x-logging` anchor.
 
 ## Findings from live testing
