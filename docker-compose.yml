@@ -1,11 +1,10 @@
-# Production deployment of the crawler on its own, deployed against Postgres and Redis that
-# already exist as their own Dokploy Database resources (managed and backed up outside this
-# file) — no postgres/redis service blocks here. docker-compose.dev.yml next to this file is the
-# local-dev Postgres/Redis only. See PRODUCTION.md.
+# Production deployment of the crawler: the crawler itself plus its own private Redis. Postgres is
+# NOT run here — it's the shared quotes database that already exists as a Dokploy Database
+# resource (managed and backed up outside this file), reached via DATABASE_URL.
+# docker-compose.dev.yml next to this file is the local-dev Postgres/Redis only. See PRODUCTION.md.
 #
 # Required env vars:
 #   DATABASE_URL — the shared quotes Postgres database's connection string
-#   REDIS_ADDR   — the crawler's own Redis connection string (redis://... is fine directly)
 
 x-logging: &default-logging
   driver: json-file
@@ -18,9 +17,12 @@ services:
     build: .
     restart: unless-stopped
     logging: *default-logging
+    depends_on:
+      crawler-redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: ${DATABASE_URL}
-      REDIS_ADDR: ${REDIS_ADDR}
+      REDIS_ADDR: crawler-redis:6379
       REDIS_DB: 0
       GOMEMLIMIT: 1536MiB
       LOG_LEVEL: error
@@ -28,11 +30,30 @@ services:
       resources:
         limits:
           memory: 2G
+    networks:
+      - internal
+      - dokploy-network
 
-# Dokploy Database resources live on the shared "dokploy-network" overlay network — a Compose
-# project's auto-created default bridge network has no route to them, and DATABASE_URL/REDIS_ADDR
-# hostnames fail DNS resolution outright. See PRODUCTION.md's findings.
+  # Private to the crawler: only on the "internal" network, never on dokploy-network, so nothing
+  # else can reach it — hence no password. No persistence either: the crawler rebuilds every key
+  # from Postgres on start (WarmSimhashCache, WarmFrontierCache), so a restart loses nothing.
+  crawler-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+# The shared Postgres (a Dokploy Database resource) lives on the "dokploy-network" overlay
+# network — a Compose project's own bridge network has no route to it, and DATABASE_URL's
+# hostname fails DNS resolution outright. See PRODUCTION.md's findings.
 networks:
-  default:
-    name: dokploy-network
+  internal:
+  dokploy-network:
     external: true

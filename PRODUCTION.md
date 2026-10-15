@@ -1,9 +1,9 @@
 # Production deployment
 
-`docker-compose.yml` deploys the crawler on its own. It deliberately has **no**
-`postgres`/`redis` service blocks — it deploys against Postgres and Redis that already exist
-elsewhere (e.g. Dokploy Database resources you manage and back up separately), via
-`DATABASE_URL`/`REDIS_ADDR`. `docker-compose.dev.yml` is the local-dev Postgres/Redis only.
+`docker-compose.yml` deploys the crawler plus its own private Redis (`crawler-redis`). It
+deliberately has **no** `postgres` service block — it deploys against the shared Postgres that
+already exists elsewhere (e.g. a Dokploy Database resource you manage and back up separately),
+via `DATABASE_URL`. `docker-compose.dev.yml` is the local-dev Postgres/Redis only.
 
 This project was split out of the Vroomy monorepo (`backend/scraper`), git history included.
 
@@ -27,8 +27,9 @@ interface and don't rename/drop them without updating Vroomy first:
 | `word_count`      | filter (`BETWEEN minWords AND maxWords`)                          |
 | `game_unsuitable` | filter (`= false`) — see `internal/scoring` / `cmd/backfill`      |
 
-Redis is private to the crawler — nothing else reads it, and it's fully rebuildable from
-Postgres on every start (`WarmSimhashCache`, `WarmFrontierCache`).
+Redis is private to the crawler — it runs inside this Compose project on a network nothing else
+joins, nothing else reads it, and it's fully rebuildable from Postgres on every start
+(`WarmSimhashCache`, `WarmFrontierCache`). That's why it has no password and no persistence.
 
 The crawler must have started at least once against a fresh database before any consumer
 relies on the `quotes` table existing.
@@ -37,11 +38,11 @@ relies on the `quotes` table existing.
 
 ```
 DATABASE_URL  — the shared quotes Postgres connection string
-REDIS_ADDR    — the crawler's own Redis (redis://... form is fine directly — see below)
 ```
 
-`.env.prod.example` documents both — copy it to `.env.prod` (gitignored) if deploying with plain
-`docker compose`. `REDIS_DB`, `GOMEMLIMIT` and `LOG_LEVEL` are already set in the compose file.
+That's the only one. `.env.prod.example` documents it — copy it to `.env.prod` (gitignored) if
+deploying with plain `docker compose`. `REDIS_ADDR` (pointing at the bundled `crawler-redis`),
+`REDIS_DB`, `GOMEMLIMIT` and `LOG_LEVEL` are already set in the compose file.
 
 ## 2. Bring it up (plain `docker compose`, no Dokploy)
 
@@ -53,9 +54,10 @@ docker compose --env-file .env.prod logs -f
 `restart: unless-stopped`, no ports, no healthcheck — it's a background worker with no HTTP
 server; its logs are the signal to watch. Stops cleanly on `SIGTERM`.
 
-The compose file pins `networks.default` to the external `dokploy-network` (see finding #3). Off
-Dokploy, either create that network (`docker network create dokploy-network`) or drop the
-`networks:` block and make sure your Postgres/Redis are reachable from the default network.
+The crawler joins the external `dokploy-network` to reach Postgres (see finding #3); Redis stays
+on the project's own `internal` network. Off Dokploy, either create that network
+(`docker network create dokploy-network`) or drop it from the crawler's `networks:` and make sure
+your Postgres is reachable some other way.
 
 ## 3. Backups
 
@@ -79,12 +81,12 @@ Local disk only — point `BACKUP_DIR` somewhere synced offsite for real disaste
 
 - Deploy as a **Compose** project with compose path `docker-compose.yml` (Dokploy's default). No Domain — there
   is nothing to route to.
-- Set `DATABASE_URL`/`REDIS_ADDR` under **Environment Settings** with **"Create Environment
+- Set `DATABASE_URL` under **Environment Settings** with **"Create Environment
   File"** enabled — with it off, every `${VAR}` silently resolves to an empty string. Saving env
   vars alone doesn't touch running containers; trigger a real **redeploy**.
-- **`REDIS_ADDR` accepts Dokploy's internal Redis URL directly** (`redis://...`) — `ConnectRedis`
-  switches to URL parsing for anything containing `://`, so `REDIS_PASSWORD`/`REDIS_DB` are
-  unused in that case.
+- **No Redis Database resource needed** — the compose file runs its own. (`REDIS_ADDR` still
+  accepts a `redis://...` URL if you ever point it at an external Redis again: `ConnectRedis`
+  switches to URL parsing for anything containing `://`.)
 - **Memory**: 2 GB hard limit, `GOMEMLIMIT=1536MiB`, both in the compose file (see finding #2).
   A memory-limit kill is a blip, not an incident: Redis is rehydrated from Postgres on start and
   `db.RequeueStuckInProgress` recovers URLs a killed process left mid-fetch.
@@ -114,7 +116,7 @@ Local disk only — point `BACKUP_DIR` somewhere synced offsite for real disaste
    real need just made the GC burn 400–600% CPU before OOMing anyway.
 3. **A plain Compose deploy lands on its own isolated network**, with no route to Dokploy's
    Database resources on `dokploy-network` — hostnames fail DNS resolution (easy to misread as a
-   credentials problem). Fixed by pinning `networks.default` to the external `dokploy-network`.
+   credentials problem). Fixed by putting the crawler on the external `dokploy-network`.
 
 If you change what the crawler does in a way that could shift its memory profile, re-measure
 with `docker stats` against an unconstrained container rather than trusting these numbers.
