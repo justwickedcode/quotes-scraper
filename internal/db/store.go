@@ -815,7 +815,7 @@ const rescoreChunkSize = 5000
 // writing back only rows whose priority actually changes. Run before WarmFrontierCache so a
 // change to how a source is scored also applies to the backlog already queued, not just to
 // URLs discovered from now on. Returns how many rows changed.
-func (s *Store) RescorePending(ctx context.Context, source string, score func(url string, errorCount int32) float64) (int, error) {
+func (s *Store) RescorePending(ctx context.Context, source string, score func(url string, errorCount int32, current float64) float64) (int, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT url, priority, error_count FROM url_frontier WHERE source = $1 AND status = 'pending'`,
 		source,
@@ -833,7 +833,7 @@ func (s *Store) RescorePending(ctx context.Context, source string, score func(ur
 			rows.Close()
 			return 0, err
 		}
-		if p := score(u, errorCount); p != old {
+		if p := score(u, errorCount, old); p != old {
 			urls = append(urls, u)
 			priorities = append(priorities, p)
 		}

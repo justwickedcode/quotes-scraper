@@ -98,12 +98,20 @@ const (
 	// something a human needs to be watching logs to catch.
 	wikiquoteExperimentalDelay = 5 * time.Second
 
-	// goodreadsExperimentalDelay: Goodreads is the highest-quality source and never runs out of
-	// content, so it starts at half its proven-safe 20s pace — requested explicitly ("goodreads
-	// should be first class priority"). Goodreads throttles by tarpitting (a slow 200 after
-	// ~60s), not with 429s, so the worker drops back to the safe pace on the first stalled fetch
-	// of any kind, not only on a 429 (see runWorker/abandonExperimentalPace).
-	goodreadsExperimentalDelay = 10 * time.Second
+	// Goodreads' pace adapts instead of being fixed (requested explicitly: "want more focus on
+	// goodreads"). It's the highest-quality source, has far more content than any Wikiquote
+	// edition, and only ever had one worker, so its fetch delay is its whole throughput. The
+	// worker starts at goodreadsStartDelay and shortens the delay by goodreadsSpeedUpStep after
+	// every goodreadsSpeedUpAfter fetches in a row without a stall, down to goodreadsMinDelay. A
+	// stall (Goodreads throttles by answering slowly, ~60s, not with 429s) doubles it, up to
+	// goodreadsMaxDelay. So it settles just under whatever rate Goodreads tolerates, instead of
+	// sitting at a guessed safe pace, and recovers after a throttled spell instead of staying
+	// slow for the rest of the run. See adaptGoodreadsPace.
+	goodreadsStartDelay   = 8 * time.Second
+	goodreadsMinDelay     = 3 * time.Second
+	goodreadsMaxDelay     = 30 * time.Second
+	goodreadsSpeedUpAfter = 10
+	goodreadsSpeedUpStep  = 1 * time.Second
 )
 
 // minSourceDelayBySource lets sources that have actually shown throttling be treated more
@@ -844,6 +852,7 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 	}
 
 	var lastFetch time.Time
+	var fastStreak int // Goodreads only: fetches in a row without a stall, see adaptGoodreadsPace
 	for {
 		if ctx.Err() != nil {
 			return
@@ -866,7 +875,7 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 				return
 			}
 		}
-		if throttle.takeRateLimited() {
+		if throttle.takeRateLimited() && source != scoring.SourceGoodreads {
 			minDelay = c.abandonExperimentalPace(source, minDelay)
 		}
 
@@ -901,11 +910,12 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 
 		lastFetch = time.Now()
 		gotQuotes, newQuotes, stalled, rateLimited := c.processURL(ctx, source, url)
+		if source == scoring.SourceGoodreads {
+			minDelay, fastStreak = adaptGoodreadsPace(minDelay, fastStreak, stalled)
+		}
 		if stalled {
 			lastFetch = lastFetch.Add(stallPenaltyFor(source) - minDelay)
-			// Goodreads signals throttling with slow responses rather than 429s, so any stall
-			// counts as the signal to leave its experimental pace.
-			if rateLimited || source == scoring.SourceGoodreads {
+			if rateLimited && source != scoring.SourceGoodreads {
 				minDelay = c.abandonExperimentalPace(source, minDelay)
 			}
 			if rateLimited {
@@ -919,14 +929,11 @@ func (c *Crawler) runWorker(ctx context.Context, source string, minDelay time.Du
 	}
 }
 
-// abandonExperimentalPace permanently widens a source's cooldown from an experimental pace
-// (wikiquoteExperimentalDelay) up to its normal, proven-safe one (minSourceDelayFor) the first
-// time a real 429 is observed at the faster pace — an automatic, one-way safety net for the
-// bounded pacing experiment, so a rate-limit signal doesn't require a human watching logs to
-// react to it. Only ever widens, never narrows back within the same process run: once real
-// evidence of rate-limiting shows up, there's no reason to risk finding it again in the same
-// run. A no-op if current is already at or above the safe pace (e.g. Goodreads, which never
-// already widened by an earlier stall).
+// abandonExperimentalPace permanently widens a Wikiquote edition's cooldown from the
+// experimental pace (wikiquoteExperimentalDelay) to its proven-safe one (minSourceDelayFor) the
+// first time a real 429 is observed — an automatic, one-way safety net, so a rate-limit signal
+// doesn't need a human watching logs. Only ever widens within a run. A no-op if current is
+// already at or above the safe pace. Goodreads uses adaptGoodreadsPace instead.
 func (c *Crawler) abandonExperimentalPace(source string, current time.Duration) time.Duration {
 	safe := minSourceDelayFor(source)
 	if current >= safe {
@@ -934,6 +941,26 @@ func (c *Crawler) abandonExperimentalPace(source string, current time.Duration) 
 	}
 	log.Printf("[%s] Throttled at the experimental %s pace — reverting to the proven-safe %s for the rest of this run", source, current, safe)
 	return safe
+}
+
+// adaptGoodreadsPace returns the Goodreads worker's next delay and fast-fetch streak after one
+// fetch — see goodreadsStartDelay. Pure, so it's unit-testable and the state stays local to the
+// worker goroutine.
+func adaptGoodreadsPace(delay time.Duration, fastStreak int, stalled bool) (time.Duration, int) {
+	if stalled {
+		next := min(delay*2, goodreadsMaxDelay)
+		if next != delay {
+			log.Printf("[goodreads] slow response — backing off to one fetch every %s", next)
+		}
+		return next, 0
+	}
+	fastStreak++
+	if fastStreak < goodreadsSpeedUpAfter || delay <= goodreadsMinDelay {
+		return delay, fastStreak
+	}
+	next := max(delay-goodreadsSpeedUpStep, goodreadsMinDelay)
+	log.Printf("[goodreads] %d fast fetches in a row — speeding up to one fetch every %s", goodreadsSpeedUpAfter, next)
+	return next, 0
 }
 
 func (c *Crawler) Run(ctx context.Context) error {
@@ -968,8 +995,12 @@ func (c *Crawler) Run(ctx context.Context) error {
 	// Goodreads is scored by URL shape (scoring.GoodreadsPriority); rescoring here applies the
 	// current scheme to the backlog already queued too, not only to URLs discovered from now on.
 	// A no-op write-wise once every pending row already matches.
-	rescored, err := c.store.RescorePending(ctx, scoring.SourceGoodreads, func(u string, errorCount int32) float64 {
-		return scoring.GoodreadsPriority(u, int(errorCount))
+	rescored, err := c.store.RescorePending(ctx, scoring.SourceGoodreads, func(u string, errorCount int32, current float64) float64 {
+		p := scoring.GoodreadsPriority(u, int(errorCount))
+		if current == p+scoring.GoodreadsStaleChainPenalty {
+			return current // demoted by processURL as a stale chain — keep it demoted
+		}
+		return p
 	})
 	if err != nil {
 		return err
@@ -1006,7 +1037,7 @@ func (c *Crawler) Run(ctx context.Context) error {
 	gdThrottle := &sourceThrottle{}
 	gd := &goodreadsDiscovery{c: c}
 	go2(func() {
-		c.runWorker(ctx, scoring.SourceGoodreads, goodreadsExperimentalDelay, gdThrottle,
+		c.runWorker(ctx, scoring.SourceGoodreads, goodreadsStartDelay, gdThrottle,
 			func(gotQuotes bool, newQuotes int) { gd.onResult(ctx, gotQuotes, newQuotes) },
 		)
 	})
