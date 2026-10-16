@@ -130,7 +130,7 @@ func (c *Crawler) runFeeder(ctx context.Context, source string, networked bool, 
 		if refillAdded < refillNewURLs {
 			noRefillUntil = time.Now().Add(refillCooldown)
 		}
-		log.Printf("[%s] refill done (%s: %d new URLs, %d queued) — back to fetching", source, why, refillAdded, n)
+		logInfo("[%s] refill done (%s: %d new URLs, %d queued) — back to fetching", source, why, refillAdded, n)
 	}
 	defer throttle.setRefilling(false)
 
@@ -148,7 +148,7 @@ func (c *Crawler) runFeeder(ctx context.Context, source string, networked bool, 
 		case !refilling && n <= frontierLowWater && time.Now().After(noRefillUntil):
 			refilling, refillStart, misses, refillAdded = true, time.Now(), 0, 0
 			throttle.setRefilling(networked)
-			log.Printf("[%s] only %d URL(s) queued — refilling before fetching more", source, n)
+			logInfo("[%s] only %d URL(s) queued — refilling before fetching more", source, n)
 		case refilling && refillAdded >= refillNewURLs:
 			endRefill(n, "got enough")
 		case refilling && misses >= refillMaxMisses:
